@@ -1,0 +1,35 @@
+__pycache__/
+*.pyc
+.venv/
+.venv311/
+.venv_py314_backup/
+.env
+.DS_Store
+
+# Data artifacts
+data/*
+!data/.gitkeep
+
+# Chroma persistence
+chroma/
+
+# Streamlit
+.streamlit/
+
+# Archives and packaging artifacts
+*.zip
+
+# Local meeting/thesis notes packs
+meeting_pack/
+meeting_pack_chatgpt/
+THESIS_BLUEPRINT.md
+THESIS_README.md
+run_thesis_pipeline.sh
+
+# Thesis-only implementation artifacts
+src/thesis/
+evaluation/thesis/
+
+# Generated local model artifacts
+models/*
+!models/.gitkeep

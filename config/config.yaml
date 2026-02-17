@@ -1,0 +1,48 @@
+models:
+  embedding_model: text-embedding-3-small
+  generation_model: gpt-4o-mini
+
+index:
+  traffic_collection: traffic_events
+  docs_collection: docs_chunks
+  batch_size: 128
+  rebuild: false
+
+retrieval:
+  top_k: 8
+  strict_mode: true
+  strict_distance_threshold: 0.42
+  bbox_candidate_limit: 20000
+
+pdf:
+  chunk_size: 1200
+  chunk_overlap: 200
+
+paths:
+  persist_dir: data/chroma
+
+predict:
+  processed_dir: data/processed
+  model_dir: models
+  min_points: 5
+  top_k: 5
+  destination:
+    min_samples_per_class: 200
+    max_classes: 80
+    max_train_rows: 120000
+    max_test_rows: 30000
+    report_top_classes: 25
+  eta:
+    max_train_rows: 120000
+    max_test_rows: 30000
+  anomaly:
+    max_rows: 120000
+
+kpi:
+  occupancy_max_expanded_rows: 3500000
+  congestion_formula: ratio_sum
+
+forecast:
+  default_horizon_weeks: 4
+  min_history_days: 60
+  backtest_days: 28
