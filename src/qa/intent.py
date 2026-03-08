@@ -104,6 +104,19 @@ PORT_TOKEN_STOPWORDS = {
     "RAG",
     "NIS2",
     "ISPS",
+    "BASED",
+    "PATTERNS",
+    "EXPECTED",
+    "PREDICT",
+    "PREDICTED",
+    "CONGESTION",
+    "LIKELY",
+    "WHICH",
+    "SHOW",
+    "SUSPICIOUS",
+    "JUMPS",
+    "MOVEMENT",
+    "CHANGES",
 }
 NON_PORT_CODE_TOKENS = {
     "JANUARY",
@@ -138,6 +151,16 @@ LAST_WEEKS_RE = re.compile(r"\blast\s+(\d{1,2})\s+weeks?\b", re.IGNORECASE)
 HORIZON_WEEKS_RE = re.compile(r"\b(\d{1,2})\s+weeks?\b", re.IGNORECASE)
 MMSI_RE = re.compile(r"\bmmsi\s*[:#]?\s*(\d{6,9})\b", re.IGNORECASE)
 IMO_RE = re.compile(r"\bimo\s*[:#]?\s*(\d{6,8})\b", re.IGNORECASE)
+LONG_DATE_RE = re.compile(
+    r"\b(?:on\s+)?(?:(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s*,?\s*)?"
+    r"(january|february|march|april|may|june|july|august|september|october|november|december)\s+"
+    r"(\d{1,2}),?\s+(20\d{2})\b",
+    re.IGNORECASE,
+)
+RELATIVE_DOW_RE = re.compile(
+    r"\b(next|this)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
+    re.IGNORECASE,
+)
 
 
 @dataclass
@@ -290,16 +313,57 @@ def _extract_horizon_weeks(question: str) -> int:
     return max(1, min(12, value))
 
 
+def _extract_target_date(question: str) -> Optional[str]:
+    # Explicit ISO date like "on 2026-02-20".
+    iso_matches = ISO_DATE_RE.findall(question)
+    if len(iso_matches) == 1:
+        return iso_matches[0]
+
+    # Explicit long date like "on Friday, February 20, 2026".
+    long_hit = LONG_DATE_RE.search(question)
+    if long_hit:
+        month = long_hit.group(2)
+        day = long_hit.group(3)
+        year = long_hit.group(4)
+        ts = pd.to_datetime(f"{month} {day} {year}", errors="coerce")
+        if pd.notna(ts):
+            return pd.Timestamp(ts).strftime("%Y-%m-%d")
+
+    # Relative weekday like "next Friday" or "this Friday".
+    rel_hit = RELATIVE_DOW_RE.search(question)
+    if rel_hit:
+        mode = rel_hit.group(1).lower()
+        day = rel_hit.group(2).lower()
+        now = pd.Timestamp.now().floor("D")
+        target_idx = DOW_NAMES.index(day)
+        delta = (target_idx - now.weekday()) % 7
+        if mode == "next":
+            if delta == 0:
+                delta = 7
+        else:  # "this"
+            if delta == 0:
+                delta = 0
+        target = now + pd.Timedelta(days=delta)
+        return target.strftime("%Y-%m-%d")
+
+    return None
+
+
 def classify_question(question: str) -> IntentResult:
     q = question.lower()
 
     start_date, end_date, window = _extract_date_range(question)
+    target_date = _extract_target_date(question)
+    if target_date and not start_date and not end_date:
+        start_date = target_date
+        end_date = target_date
     dows = _extract_days_of_week(question)
     entities: Dict[str, Any] = {
         "ports": _extract_ports(question),
         "port": None,
         "date_from": start_date,
         "date_to": end_date,
+        "target_date": target_date,
         "window": window,
         "vessel_type": _extract_vessel_type(question),
         "dow": dows[0] if dows else None,
