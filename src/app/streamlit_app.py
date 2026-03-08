@@ -117,7 +117,14 @@ def _retrieve_evidence(
     top_k: int,
     include_dates: bool,
 ) -> EvidenceBundle:
-    empty = EvidenceBundle(lines=[], rows=[], trace={})
+    empty = EvidenceBundle(
+        lines=[],
+        rows=[],
+        trace={
+            "retrieval_status": "disabled",
+            "reason": "Retriever unavailable (missing OPENAI_API_KEY or retriever init failure).",
+        },
+    )
     if retriever is None:
         return empty
 
@@ -126,8 +133,15 @@ def _retrieve_evidence(
         started = time.perf_counter()
         result = retriever.query_traffic(question=question, filters=filters, top_k=top_k)
         latency_ms = (time.perf_counter() - started) * 1000.0
-    except Exception:
-        return empty
+    except Exception as exc:
+        return EvidenceBundle(
+            lines=[],
+            rows=[],
+            trace={
+                "retrieval_status": "error",
+                "reason": f"Vector retrieval failed: {exc}",
+            },
+        )
 
     lines: List[str] = []
     rows: List[Dict[str, Any]] = []
@@ -179,6 +193,9 @@ def _retrieve_evidence(
     }
 
     trace = {
+        "retrieval_status": "ok" if rows else "no_hits",
+        "reason": "Vector rows retrieved successfully." if rows else "No vector rows matched the query and filters.",
+        "collection": retriever.config["index"]["traffic_collection"],
         "mode": result.mode,
         "query_latency_ms": round(latency_ms, 2),
         "returned_items": len(result.evidence),
@@ -592,6 +609,30 @@ def _render_compact_result(
                 deduped.append(step)
         return deduped
 
+    def _build_port_actions(value: Union[AnalyticsResult, ForecastResult]) -> List[str]:
+        actions: List[str] = []
+        if isinstance(value, ForecastResult) and value.forecast is not None and not value.forecast.empty:
+            pred = float(value.forecast["predicted"].mean())
+            upper = float(value.forecast["upper"].mean()) if "upper" in value.forecast.columns else pred
+            spread = max(0.0, upper - pred)
+            if pred >= 1.5:
+                actions.append("Plan additional berth/pilot/tug capacity on the forecasted peak day window.")
+            else:
+                actions.append("Keep normal berth allocation, but monitor updates as the target date approaches.")
+            if spread >= 0.6:
+                actions.append("Keep an operational buffer due to wider forecast uncertainty.")
+            actions.append("Use the retrieval evidence rows to pre-brief traffic control with similar historical days.")
+            return actions
+
+        answer_text = value.answer.lower()
+        if "jump" in answer_text or "anomaly" in answer_text:
+            actions.append("Open AIS integrity checks for listed MMSI and validate with external tracking feeds.")
+            actions.append("Flag suspicious tracks for VTS review before acting on route deviations.")
+        else:
+            actions.append("Use the daily/weekly pattern in the chart to plan shift staffing and pilot windows.")
+            actions.append("Re-run this query with tighter vessel-type filters for targeted operational planning.")
+        return actions
+
     def _to_naive_datetime(series: pd.Series) -> pd.Series:
         parsed = pd.to_datetime(series, errors="coerce", utc=True)
         return parsed.dt.tz_convert(None)
@@ -770,14 +811,31 @@ def _render_compact_result(
         for idx, step in enumerate(method_steps, start=1):
             st.markdown(f"{idx}. {step}")
 
-    if evidence.trace or evidence.rows:
-        with st.expander("Retrieval Trace", expanded=False):
-            if evidence.trace:
-                st.json(evidence.trace)
-            if evidence.rows:
-                trace_df = pd.DataFrame(evidence.rows)
-                cols = [c for c in ["vector_id", "chunk_id", "distance", "timestamp", "port", "vessel_type", "mmsi"] if c in trace_df.columns]
-                st.dataframe(trace_df[cols], use_container_width=True, hide_index=True)
+    st.subheader("Port Operations Recommendations")
+    for action in _build_port_actions(result):
+        st.markdown(f"- {action}")
+
+    st.subheader("Retrieval Provenance")
+    trace = evidence.trace or {}
+    status = str(trace.get("retrieval_status", "unknown")).upper()
+    reason = str(trace.get("reason", "No retrieval status available."))
+    st.write(f"Status: `{status}`")
+    st.write(reason)
+    if trace:
+        st.write(
+            f"Collection: `{trace.get('collection', 'n/a')}` | "
+            f"Mode: `{trace.get('mode', 'n/a')}` | "
+            f"Latency: `{trace.get('query_latency_ms', 'n/a')} ms` | "
+            f"Returned: `{trace.get('returned_items', 0)}`"
+        )
+    if evidence.rows:
+        trace_df = pd.DataFrame(evidence.rows)
+        cols = [c for c in ["vector_id", "chunk_id", "distance", "timestamp", "port", "vessel_type", "mmsi"] if c in trace_df.columns]
+        st.dataframe(trace_df[cols], use_container_width=True, hide_index=True)
+    else:
+        st.info("No vector rows available for this query. Evidence above may come from deterministic KPI computation.")
+    with st.expander("Raw retrieval trace JSON", expanded=False):
+        st.json(trace)
 
 
 def main() -> None:
