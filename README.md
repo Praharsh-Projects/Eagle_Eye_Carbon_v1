@@ -127,12 +127,15 @@ To run full-scale retrieval on cloud (same behavior as local), connect a remote 
 
 To bootstrap full processed runtime data on cloud from a hosted bundle, set:
 - `APP_PROCESSED_BUNDLE_URL = "https://.../eagle_eye_processed_bundle.tar.gz"`
+- Optional for anomaly/jump detection without retriever:
+- `APP_EVENTS_BUNDLE_URL = "https://.../eagle_eye_events_bundle.tar.gz"`
 
 Create that bundle locally:
 ```bash
 python -m src.utils.package_cloud_bundle \
   --processed_dir data/processed \
-  --out dist/eagle_eye_processed_bundle.tar.gz
+  --out dist/eagle_eye_processed_bundle.tar.gz \
+  --events_out dist/eagle_eye_events_bundle.tar.gz
 ```
 
 Index directly to remote service:
@@ -150,6 +153,7 @@ python -m src.index.build_index \
 Cloud parity summary:
 - Deterministic analytics/forecast parity: bundled in `demo_data/processed`, or bootstrap via `APP_PROCESSED_BUNDLE_URL`
 - Retrieval parity: requires remote Chroma service because local `data/chroma` is too large for Streamlit Cloud
+- AIS jump/spoof anomaly parity without retriever: requires `APP_EVENTS_BUNDLE_URL` because those queries need row-level AIS events
 
 ## 6) Congestion Definition (used in code)
 

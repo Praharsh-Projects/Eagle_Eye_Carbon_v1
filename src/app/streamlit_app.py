@@ -20,6 +20,7 @@ from src.forecast.forecast import ForecastEngine, ForecastResult
 from src.kpi.query import AnalyticsResult, KPIQueryEngine
 from src.qa.intent import IntentResult, classify_question
 from src.rag.retriever import QueryFilters, RAGRetriever
+from src.utils.ais_anomaly import detect_sudden_jump_events_from_parquet
 from src.utils.cloud_bootstrap import ensure_bundle
 from src.utils.config import load_config
 from src.utils.runtime import chroma_remote_settings
@@ -144,6 +145,25 @@ def _maybe_bootstrap_processed_bundle(preferred_dir: Path) -> tuple[bool, str]:
     bundle_url, source = _load_runtime_setting("APP_PROCESSED_BUNDLE_URL")
     if not bundle_url:
         return False, "No APP_PROCESSED_BUNDLE_URL configured."
+
+    changed, message = ensure_bundle(
+        url=bundle_url,
+        target_dir=preferred_dir,
+        required_files=required_files,
+    )
+    if source != "missing":
+        message = f"{message} Source: {source}."
+    return changed, message
+
+
+def _maybe_bootstrap_events_bundle(preferred_dir: Path) -> tuple[bool, str]:
+    required_files = ["events.parquet"]
+    if all((preferred_dir / name).exists() for name in required_files):
+        return False, f"Events runtime asset already exists in {preferred_dir}."
+
+    bundle_url, source = _load_runtime_setting("APP_EVENTS_BUNDLE_URL")
+    if not bundle_url:
+        return False, "No APP_EVENTS_BUNDLE_URL configured."
 
     changed, message = ensure_bundle(
         url=bundle_url,
@@ -416,6 +436,7 @@ def _handle_ask_question(
     retriever: Optional[RAGRetriever],
     top_k_evidence: int,
     user_filters: Dict[str, Any],
+    events_path: Optional[Path],
 ) -> tuple[Union[AnalyticsResult, ForecastResult], EvidenceBundle]:
     entities = intent_result.entities
     q_lower = question.lower()
@@ -565,11 +586,36 @@ def _handle_ask_question(
         return result, evidence
 
     if intent_result.intent == "F":
-        if any(token in q_lower for token in ("jump", "spoof", "teleport", "impossible")) and retriever is not None:
+        if any(token in q_lower for token in ("jump", "spoof", "teleport", "impossible")):
             filters = _make_rag_filters(entities=entities, overrides=user_filters, include_dates=True)
-            jumps = retriever.detect_sudden_jumps(filters=filters)
-            count = int(jumps.get("count", 0))
-            events = pd.DataFrame(jumps.get("events") or [])
+            jump_result: Dict[str, Any]
+            if retriever is not None:
+                jump_result = retriever.detect_sudden_jumps(filters=filters)
+            elif events_path and events_path.exists():
+                jump_result = detect_sudden_jump_events_from_parquet(
+                    events_path=events_path,
+                    mmsi=filters.mmsi,
+                    date_from=filters.date_from,
+                    date_to=filters.date_to,
+                )
+            else:
+                return (
+                    AnalyticsResult(
+                        status="no_data",
+                        answer="I don't have row-level AIS evidence in the current runtime to verify jump anomalies.",
+                        table=None,
+                        chart=None,
+                        coverage_notes=[],
+                        caveats=[
+                            "This query needs either a working vector retriever or events.parquet in the cloud runtime.",
+                            "Configure remote Chroma or set APP_EVENTS_BUNDLE_URL for event-level anomaly detection.",
+                        ],
+                    ),
+                    EvidenceBundle(lines=[], rows=[], trace={}),
+                )
+
+            count = int(jump_result.get("count", 0))
+            events = pd.DataFrame(jump_result.get("events") or [])
             chart = None
             table = None
             if not events.empty:
@@ -605,7 +651,10 @@ def _handle_ask_question(
                 answer=f"Detected {count} potential sudden AIS coordinate jumps in the filtered range.",
                 table=table,
                 chart=chart,
-                coverage_notes=[f"Rows used: {count}", "Data sources used: AIS metadata index"],
+                coverage_notes=[
+                    f"Rows used: {count}",
+                    "Data sources used: AIS metadata index" if retriever is not None else "Data sources used: row-level AIS events parquet",
+                ],
                 caveats=[
                     "Jump rule: coordinate displacement above threshold within 30 minutes.",
                     "This is a heuristic anomaly indicator, not proof of spoofing.",
@@ -1044,6 +1093,9 @@ def main() -> None:
     processed_bootstrap_changed, processed_bootstrap_message = _maybe_bootstrap_processed_bundle(
         configured_processed_dir
     )
+    events_bootstrap_changed, events_bootstrap_message = _maybe_bootstrap_events_bundle(
+        configured_processed_dir
+    )
     default_processed_dir, using_demo_processed = _resolve_processed_dir(configured_processed_dir)
     configured_persist_dir = Path(config["paths"].get("persist_dir", "data/chroma"))
     requested_vector_mode = str(
@@ -1068,6 +1120,8 @@ def main() -> None:
             st.info(processed_bootstrap_message)
         elif "No APP_PROCESSED_BUNDLE_URL configured." not in processed_bootstrap_message:
             st.warning(processed_bootstrap_message)
+        if events_bootstrap_changed:
+            st.info(events_bootstrap_message)
         if using_remote_vector:
             st.info("Using remote Chroma service (configured via CHROMA_* / VECTOR_DB_MODE).")
         if using_demo_chroma:
@@ -1104,6 +1158,7 @@ def main() -> None:
             st.warning("Set `OPENAI_API_KEY` in app secrets to enable vector retrieval evidence.")
 
     st.session_state["retriever_reason"] = retriever_reason
+    events_path = configured_processed_dir / "events.parquet"
 
     st.subheader("Sample Queries")
     if "ask_question" not in st.session_state:
@@ -1150,6 +1205,7 @@ def main() -> None:
         retriever=retriever,
         top_k_evidence=top_k_evidence,
         user_filters=user_filters,
+        events_path=events_path if events_path.exists() else None,
     )
 
     _render_compact_result(result=result, evidence=evidence)
