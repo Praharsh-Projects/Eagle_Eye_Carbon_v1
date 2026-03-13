@@ -605,6 +605,19 @@ def _render_compact_result(
         lines: List[str] = []
 
         if isinstance(value, ForecastResult):
+            anchor_values_note = next(
+                (n for n in value.coverage_notes if n.startswith("Analog values used:")),
+                None,
+            )
+            anchor_dates_note = next(
+                (n for n in value.coverage_notes if n.startswith("Analog dates used:")),
+                None,
+            )
+            if anchor_values_note:
+                lines.append(anchor_values_note)
+            elif anchor_dates_note:
+                lines.append(anchor_dates_note)
+
             if value.history is not None and not value.history.empty:
                 hist = value.history.copy()
                 if "date" in hist.columns and "actual" in hist.columns:
@@ -627,9 +640,6 @@ def _render_compact_result(
                             f"Forecast target | {row['date'].strftime('%Y-%m-%d')} | "
                             f"pred={float(row['predicted']):.2f}, range={lower:.2f}-{upper:.2f}"
                         )
-            analog_note = next((n for n in value.coverage_notes if n.startswith("Analog dates used:")), None)
-            if analog_note:
-                lines.append(analog_note)
             return lines[:max_items]
 
         if value.table is not None and not value.table.empty:
@@ -670,6 +680,7 @@ def _render_compact_result(
                     or note.startswith("Target date:")
                     or note.startswith("Forecast target weekday:")
                     or note.startswith("Analog dates used:")
+                    or note.startswith("Analog values used:")
                     or note.startswith("Meaning:")
                 ):
                     steps.append(note)
@@ -927,13 +938,13 @@ def _render_compact_result(
     retrieved_lines = evidence.lines
     computed_lines = _fallback_evidence_from_result(result)
 
-    if retrieved_lines:
-        st.markdown("**Retrieved evidence**")
-        for line in retrieved_lines:
-            st.markdown(f"- {line}")
     if computed_lines:
         st.markdown("**Computed evidence used for this answer**")
         for line in computed_lines:
+            st.markdown(f"- {line}")
+    if retrieved_lines:
+        st.markdown("**Retrieved supporting evidence**")
+        for line in retrieved_lines:
             st.markdown(f"- {line}")
     if not retrieved_lines and not computed_lines:
         st.info("No evidence rows were available for this response.")

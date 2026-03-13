@@ -92,8 +92,14 @@ class ForecastEngine:
 
     @staticmethod
     def _confidence_label(sample_count: int, tier: int) -> str:
-        if tier <= 2 and sample_count >= 4:
+        if tier == 1 and sample_count >= 4:
             return "high"
+        if tier == 1 and sample_count >= 2:
+            return "medium"
+        if tier == 2 and sample_count >= 3:
+            return "high"
+        if tier == 2 and sample_count >= 2:
+            return "medium"
         if tier <= 4 and sample_count >= 3:
             return "medium"
         if sample_count >= 5:
@@ -123,7 +129,7 @@ class ForecastEngine:
     def _seasonal_analog(
         series: pd.Series,
         target_date: pd.Timestamp,
-    ) -> tuple[float, float, float, str, int, str, List[str]]:
+    ) -> tuple[float, float, float, str, int, str, List[str], List[str]]:
         hist = series.reset_index()
         hist.columns = ["date", "value"]
         hist["date"] = pd.to_datetime(hist["date"], errors="coerce", utc=True).dt.floor("D")
@@ -181,7 +187,7 @@ class ForecastEngine:
                 break
 
         if selected.empty:
-            return 0.0, 0.0, 0.0, "no analog samples", 0, "low", []
+            return 0.0, 0.0, 0.0, "no analog samples", 0, "low", [], []
 
         selected_values = selected["value"].astype(float)
         pred = float(selected_values.mean())
@@ -199,7 +205,11 @@ class ForecastEngine:
             .drop_duplicates()
             .tolist()
         )
-        return pred, lower, upper, tier_label, len(selected), confidence, analog_dates
+        analog_points = [
+            f"{row['date'].strftime('%Y-%m-%d')}={float(row['value']):.2f}"
+            for _, row in selected.sort_values("date").iterrows()
+        ]
+        return pred, lower, upper, tier_label, len(selected), confidence, analog_dates, analog_points
 
     def forecast_arrivals(
         self,
@@ -351,7 +361,7 @@ class ForecastEngine:
             method_note = "Method: weekly-seasonal baseline + moving-average model."
             analog_note = None
         else:
-            pred, lower, upper, tier_label, sample_count, confidence, analog_dates = self._seasonal_analog(
+            pred, lower, upper, tier_label, sample_count, confidence, analog_dates, analog_points = self._seasonal_analog(
                 series=series,
                 target_date=target_ts,
             )
@@ -367,6 +377,11 @@ class ForecastEngine:
                 if analog_dates
                 else "Analog dates used: none"
             )
+            analog_values_note = (
+                "Analog values used: " + ", ".join(analog_points[:12])
+                if analog_points
+                else "Analog values used: none"
+            )
 
         meaning = self._congestion_meaning(pred)
         level = self._congestion_level(pred)
@@ -377,6 +392,7 @@ class ForecastEngine:
         notes.append(f"Meaning: {meaning}")
         if analog_note:
             notes.append(analog_note)
+            notes.append(analog_values_note)
 
         caveats = [
             "Congestion index is a proxy from arrivals and dwell-time availability, not berth-level operations.",
@@ -391,7 +407,8 @@ class ForecastEngine:
             answer=(
                 f"Predicted congestion index at {port or 'selected port'} on {target_ts.strftime('%Y-%m-%d')} "
                 f"is {pred:.2f} (range {lower:.2f} to {upper:.2f}). "
-                f"This indicates {level} pressure versus baseline (1.00)."
+                f"This indicates {level} pressure versus baseline (1.00). "
+                f"The estimate is anchored to historical matches from the same calendar date/seasonal pattern."
             ),
             history=history_df,
             forecast=forecast_df,
