@@ -19,6 +19,10 @@ APP_PROCESSED_FILES = [
 ]
 
 EVENTS_FILE = "events.parquet"
+CHROMA_REQUIRED_FILES = [
+    "chroma.sqlite3",
+    "traffic_metadata_index.csv",
+]
 
 
 def _build_cli() -> argparse.ArgumentParser:
@@ -29,6 +33,16 @@ def _build_cli() -> argparse.ArgumentParser:
         "--events_out",
         default="",
         help="Optional output path for a separate events bundle containing events.parquet.",
+    )
+    parser.add_argument(
+        "--chroma_dir",
+        default="",
+        help="Optional Chroma directory to package for full local retrieval parity.",
+    )
+    parser.add_argument(
+        "--chroma_out",
+        default="",
+        help="Optional output path for a Chroma bundle archive.",
     )
     return parser
 
@@ -63,6 +77,21 @@ def main() -> None:
             tf.add(events_src, arcname=EVENTS_FILE)
         events_size_mb = events_out.stat().st_size / (1024 * 1024)
         print(f"Created {events_out} ({events_size_mb:.1f} MB)")
+
+    if args.chroma_out:
+        chroma_dir = Path(args.chroma_dir or "data/chroma")
+        missing_chroma = [name for name in CHROMA_REQUIRED_FILES if not (chroma_dir / name).exists()]
+        if missing_chroma:
+            raise FileNotFoundError(
+                "Missing required Chroma files: " + ", ".join(missing_chroma)
+            )
+        chroma_out = Path(args.chroma_out)
+        chroma_out.parent.mkdir(parents=True, exist_ok=True)
+        with tarfile.open(chroma_out, "w:gz") as tf:
+            for child in chroma_dir.iterdir():
+                tf.add(child, arcname=child.name)
+        chroma_size_mb = chroma_out.stat().st_size / (1024 * 1024)
+        print(f"Created {chroma_out} ({chroma_size_mb:.1f} MB)")
 
 
 if __name__ == "__main__":

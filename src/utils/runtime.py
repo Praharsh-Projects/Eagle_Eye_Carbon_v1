@@ -2,10 +2,11 @@
 
 from __future__ import annotations
 
+from contextlib import contextmanager
 import os
 import sys
 from pathlib import Path
-from typing import Any, Dict, Optional, Tuple
+from typing import Any, Dict, Iterator, Optional, Tuple
 
 
 def ensure_supported_python() -> None:
@@ -36,6 +37,40 @@ def _as_bool(value: Optional[str], default: bool = False) -> bool:
     if token in {"0", "false", "no", "n", "off"}:
         return False
     return default
+
+
+REMOTE_VECTOR_ENV_NAMES = (
+    "VECTOR_DB_MODE",
+    "CHROMA_HOST",
+    "CHROMA_PORT",
+    "CHROMA_SSL",
+    "CHROMA_TENANT",
+    "CHROMA_DATABASE",
+    "CHROMA_AUTH_TOKEN",
+    "CHROMA_AUTH_HEADER",
+)
+
+
+@contextmanager
+def force_local_vector_env() -> Iterator[None]:
+    """
+    Temporarily disable remote vector settings so Chroma opens a local persistent index.
+    Useful when a remote Chroma endpoint is configured but unreachable and a local bundle exists.
+    """
+    previous = {name: os.environ.get(name) for name in REMOTE_VECTOR_ENV_NAMES}
+    try:
+        os.environ["VECTOR_DB_MODE"] = "local"
+        for name in REMOTE_VECTOR_ENV_NAMES:
+            if name == "VECTOR_DB_MODE":
+                continue
+            os.environ.pop(name, None)
+        yield
+    finally:
+        for name, value in previous.items():
+            if value is None:
+                os.environ.pop(name, None)
+            else:
+                os.environ[name] = value
 
 
 def chroma_remote_settings(config: Optional[Dict[str, Any]] = None) -> Optional[Dict[str, Any]]:

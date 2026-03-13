@@ -129,13 +129,17 @@ To bootstrap full processed runtime data on cloud from a hosted bundle, set:
 - `APP_PROCESSED_BUNDLE_URL = "https://.../eagle_eye_processed_bundle.tar.gz"`
 - Optional for anomaly/jump detection without retriever:
 - `APP_EVENTS_BUNDLE_URL = "https://.../eagle_eye_events_bundle.tar.gz"`
+- Optional for local-bundle retrieval fallback on hosts with enough disk:
+- `APP_CHROMA_BUNDLE_URL = "https://.../eagle_eye_chroma_bundle.tar.gz"`
 
 Create that bundle locally:
 ```bash
 python -m src.utils.package_cloud_bundle \
   --processed_dir data/processed \
   --out dist/eagle_eye_processed_bundle.tar.gz \
-  --events_out dist/eagle_eye_events_bundle.tar.gz
+  --events_out dist/eagle_eye_events_bundle.tar.gz \
+  --chroma_dir data/chroma \
+  --chroma_out dist/eagle_eye_chroma_bundle.tar.gz
 ```
 
 Index directly to remote service:
@@ -154,6 +158,7 @@ Cloud parity summary:
 - Deterministic analytics/forecast parity: bundled in `demo_data/processed`, or bootstrap via `APP_PROCESSED_BUNDLE_URL`
 - Retrieval parity: requires remote Chroma service because local `data/chroma` is too large for Streamlit Cloud
 - AIS jump/spoof anomaly parity without retriever: requires `APP_EVENTS_BUNDLE_URL` because those queries need row-level AIS events
+- On non-Streamlit hosts with enough disk, `APP_CHROMA_BUNDLE_URL` can bootstrap a local full vector store and avoid remote Chroma entirely
 
 ## 6) Congestion Definition (used in code)
 
@@ -190,3 +195,59 @@ Out of scope (clean refusal):
 - If retrieval is disabled on cloud, check Streamlit secrets for `OPENAI_API_KEY` and `CHROMA_*` variables.
 - If cloud is still on partial coverage, verify whether the sidebar shows `demo_data/processed`; if so, either upload the processed bundle or set `APP_PROCESSED_BUNDLE_URL`.
 - If Ask has no deterministic output, run `python -m src.kpi.build_kpis ...` first.
+
+## 10) Full Deployment Alternative (Recommended for Local-Parity Hosting)
+
+Streamlit Cloud is not a good target for the full local model because the local Chroma store is several GB.
+For full deployment, use the FastAPI service in this repo on a host with disk, such as Render, Railway, Fly.io, or a VPS.
+
+### Run locally
+
+```bash
+./run_api.sh
+```
+
+API endpoints:
+- `GET /health`
+- `POST /ask`
+- Swagger docs at `http://localhost:8000/docs`
+
+### Docker run
+
+```bash
+docker build -t eagle-eye .
+docker run --rm -p 8000:8000 \
+  -e OPENAI_API_KEY="..." \
+  -e APP_PROCESSED_BUNDLE_URL="https://.../eagle_eye_processed_bundle.tar.gz" \
+  -e APP_EVENTS_BUNDLE_URL="https://.../eagle_eye_events_bundle.tar.gz" \
+  -e APP_CHROMA_BUNDLE_URL="https://.../eagle_eye_chroma_bundle.tar.gz" \
+  eagle-eye
+```
+
+### Recommended production modes
+
+1. `FastAPI + remote Chroma`
+- Best when you already operate a Chroma service.
+- Set `VECTOR_DB_MODE=remote` plus `CHROMA_*` variables.
+
+2. `FastAPI + local bundle bootstrap`
+- Best when you want one deployed service and can attach disk.
+- Set:
+  - `APP_PROCESSED_BUNDLE_URL`
+  - `APP_EVENTS_BUNDLE_URL`
+  - `APP_CHROMA_BUNDLE_URL`
+- Do not set `VECTOR_DB_MODE=remote`.
+
+This repo also includes `render.yaml` for a Render web-service deployment with an attached disk.
+
+### Example request
+
+```bash
+curl -X POST http://localhost:8000/ask \
+  -H "Content-Type: application/json" \
+  -d '{
+    "question": "What will congestion be at LVVNT on Friday, February 20, 2026?",
+    "top_k_evidence": 5,
+    "filters": {"port": "LVVNT"}
+  }'
+```

@@ -1,0 +1,27 @@
+services:
+  - type: web
+    name: eagle-eye-api
+    env: docker
+    plan: starter
+    autoDeploy: true
+    disk:
+      name: eagle-eye-data
+      mountPath: /app/data
+      sizeGB: 12
+    envVars:
+      - key: OPENAI_API_KEY
+        sync: false
+      - key: APP_PROCESSED_BUNDLE_URL
+        sync: false
+      - key: APP_EVENTS_BUNDLE_URL
+        sync: false
+      - key: APP_CHROMA_BUNDLE_URL
+        sync: false
+      - key: VECTOR_DB_MODE
+        sync: false
+      - key: CHROMA_HOST
+        sync: false
+      - key: CHROMA_PORT
+        value: "8000"
+      - key: CHROMA_SSL
+        value: "true"

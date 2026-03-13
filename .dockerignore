@@ -1,0 +1,17 @@
+.git
+.gitignore
+.venv
+.venv311
+.venv_py314_backup
+__pycache__
+*.pyc
+.DS_Store
+
+data
+dist
+meeting_pack
+meeting_pack_chatgpt
+models
+
+evaluation
+src/thesis

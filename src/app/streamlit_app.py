@@ -23,7 +23,7 @@ from src.rag.retriever import QueryFilters, RAGRetriever
 from src.utils.ais_anomaly import detect_sudden_jump_events_from_parquet
 from src.utils.cloud_bootstrap import ensure_bundle
 from src.utils.config import load_config
-from src.utils.runtime import chroma_remote_settings
+from src.utils.runtime import chroma_remote_settings, force_local_vector_env
 from src.utils.serialization import compact_traffic_evidence
 
 
@@ -59,7 +59,14 @@ def _init_forecast_engine(processed_dir: str) -> ForecastEngine:
 
 
 @st.cache_resource
-def _init_retriever(persist_dir: str, config_path: str) -> RAGRetriever:
+def _init_retriever(
+    persist_dir: str,
+    config_path: str,
+    force_local_vector: bool = False,
+) -> RAGRetriever:
+    if force_local_vector:
+        with force_local_vector_env():
+            return RAGRetriever(persist_dir=persist_dir, config_path=config_path)
     return RAGRetriever(persist_dir=persist_dir, config_path=config_path)
 
 
@@ -169,6 +176,26 @@ def _maybe_bootstrap_events_bundle(preferred_dir: Path) -> tuple[bool, str]:
         url=bundle_url,
         target_dir=preferred_dir,
         required_files=required_files,
+    )
+    if source != "missing":
+        message = f"{message} Source: {source}."
+    return changed, message
+
+
+def _maybe_bootstrap_chroma_bundle(preferred_dir: Path) -> tuple[bool, str]:
+    required_files = ["chroma.sqlite3", "traffic_metadata_index.csv"]
+    if all((preferred_dir / name).exists() for name in required_files):
+        return False, f"Chroma runtime assets already exist in {preferred_dir}."
+
+    bundle_url, source = _load_runtime_setting("APP_CHROMA_BUNDLE_URL")
+    if not bundle_url:
+        return False, "No APP_CHROMA_BUNDLE_URL configured."
+
+    changed, message = ensure_bundle(
+        url=bundle_url,
+        target_dir=preferred_dir,
+        required_files=required_files,
+        timeout_seconds=1800,
     )
     if source != "missing":
         message = f"{message} Source: {source}."
@@ -1098,6 +1125,8 @@ def main() -> None:
     )
     default_processed_dir, using_demo_processed = _resolve_processed_dir(configured_processed_dir)
     configured_persist_dir = Path(config["paths"].get("persist_dir", "data/chroma"))
+    chroma_bootstrap_changed = False
+    chroma_bootstrap_message = ""
     requested_vector_mode = str(
         os.getenv("VECTOR_DB_MODE", config.get("vector_db", {}).get("mode", "local"))
     ).strip().lower()
@@ -1106,6 +1135,9 @@ def main() -> None:
         persist_dir = configured_persist_dir
         using_demo_chroma = False
     else:
+        chroma_bootstrap_changed, chroma_bootstrap_message = _maybe_bootstrap_chroma_bundle(
+            configured_persist_dir
+        )
         persist_dir, using_demo_chroma = _resolve_persist_dir(configured_persist_dir)
 
     with st.sidebar:
@@ -1124,9 +1156,13 @@ def main() -> None:
             st.info(events_bootstrap_message)
         if using_remote_vector:
             st.info("Using remote Chroma service (configured via CHROMA_* / VECTOR_DB_MODE).")
+        elif chroma_bootstrap_changed:
+            st.info(chroma_bootstrap_message)
         if using_demo_chroma:
             st.info("Running with bundled demo vector index (`demo_data/chroma`).")
             st.caption("Full retrieval parity with local requires a remote Chroma service because the full local vector store is too large for cloud packaging.")
+        elif chroma_bootstrap_message and "No APP_CHROMA_BUNDLE_URL configured." not in chroma_bootstrap_message:
+            st.caption(chroma_bootstrap_message)
         if requested_vector_mode in {"remote", "http"} and not using_remote_vector:
             st.warning("VECTOR_DB_MODE is remote but CHROMA_HOST is missing/invalid; using local/demo index.")
         if not using_demo_processed and not processed_bootstrap_changed:
@@ -1152,13 +1188,43 @@ def main() -> None:
         except Exception as exc:
             retriever = None
             retriever_reason = f"Retriever init failed: {exc}"
+            if using_remote_vector:
+                chroma_bootstrap_changed, chroma_bootstrap_message = _maybe_bootstrap_chroma_bundle(
+                    configured_persist_dir
+                )
+                fallback_persist_dir, fallback_using_demo_chroma = _resolve_persist_dir(configured_persist_dir)
+                if (fallback_persist_dir / "chroma.sqlite3").exists():
+                    try:
+                        retriever = _init_retriever(
+                            persist_dir=str(fallback_persist_dir),
+                            config_path=config_path,
+                            force_local_vector=True,
+                        )
+                        persist_dir = fallback_persist_dir
+                        using_demo_chroma = fallback_using_demo_chroma
+                        retriever_reason = (
+                            f"Remote retriever failed ({exc}). "
+                            f"Fell back to local vector store at {fallback_persist_dir} "
+                            f"(backend: {retriever.vector_backend})."
+                        )
+                    except Exception as local_exc:
+                        retriever = None
+                        retriever_reason = (
+                            f"Remote retriever failed ({exc}); local fallback failed ({local_exc})."
+                        )
     else:
         retriever_reason = "Retriever unavailable: `OPENAI_API_KEY` not found in environment or Streamlit secrets."
         with st.sidebar:
             st.warning("Set `OPENAI_API_KEY` in app secrets to enable vector retrieval evidence.")
 
+    with st.sidebar:
+        if "Fell back to local vector store" in retriever_reason:
+            st.warning(retriever_reason)
+
     st.session_state["retriever_reason"] = retriever_reason
     events_path = configured_processed_dir / "events.parquet"
+    if not events_path.exists():
+        events_path = default_processed_dir / "events.parquet"
 
     st.subheader("Sample Queries")
     if "ask_question" not in st.session_state:
