@@ -119,7 +119,12 @@ class CarbonQueryEngine:
         self._evidence: Optional[pd.DataFrame] = None
         self._params: Optional[Dict[str, Any]] = None
         self.export_dir = self.processed_dir / "carbon_exports"
-        self.export_dir.mkdir(parents=True, exist_ok=True)
+        self._runtime_export_fallback_dir = Path("/tmp/eagle_eye_carbon_exports")
+        try:
+            self.export_dir.mkdir(parents=True, exist_ok=True)
+        except OSError:
+            # Read-only runtimes (e.g., docker volume mounted :ro) should not fail query execution.
+            pass
         if auto_build:
             self.ensure_built()
 
@@ -229,11 +234,9 @@ class CarbonQueryEngine:
             summary[pol] = {"point": point, "lower": lower, "upper": upper}
         return summary
 
-    def _write_exports(self, prefix: str, table: pd.DataFrame, payload: Dict[str, Any]) -> tuple[str, str]:
+    def _write_exports(self, prefix: str, table: pd.DataFrame, payload: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
         stamp = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
-        csv_path = self.export_dir / f"{prefix}_{stamp}.csv"
-        json_path = self.export_dir / f"{prefix}_{stamp}.json"
-        table.to_csv(csv_path, index=False)
+        candidate_dirs = [self.export_dir, self._runtime_export_fallback_dir]
 
         def _json_default(value: Any) -> Any:
             if isinstance(value, pd.Timestamp):
@@ -244,8 +247,17 @@ class CarbonQueryEngine:
                 return float(value)
             return str(value)
 
-        json_path.write_text(json.dumps(payload, indent=2, default=_json_default), encoding="utf-8")
-        return str(csv_path), str(json_path)
+        for out_dir in candidate_dirs:
+            try:
+                out_dir.mkdir(parents=True, exist_ok=True)
+                csv_path = out_dir / f"{prefix}_{stamp}.csv"
+                json_path = out_dir / f"{prefix}_{stamp}.json"
+                table.to_csv(csv_path, index=False)
+                json_path.write_text(json.dumps(payload, indent=2, default=_json_default), encoding="utf-8")
+                return str(csv_path), str(json_path)
+            except OSError:
+                continue
+        return None, None
 
     def query_port_emissions(
         self,
@@ -359,6 +371,8 @@ class CarbonQueryEngine:
             "rows": table.to_dict(orient="records"),
         }
         export_csv, export_json = self._write_exports("carbon_port_emissions", table, payload)
+        if not export_csv or not export_json:
+            caveats.append("Export files were skipped because runtime storage is read-only.")
 
         return CarbonResult(
             status="ok",
@@ -455,6 +469,12 @@ class CarbonQueryEngine:
             "rows": table.to_dict(orient="records"),
         }
         export_csv, export_json = self._write_exports("carbon_vessel_call", table, payload)
+        caveats = [
+            "Confidence reflects inventory evidence quality and assumption strength.",
+            "Operational recommendations should be combined with local fuel and engine records when available.",
+        ]
+        if not export_csv or not export_json:
+            caveats.append("Export files were skipped because runtime storage is read-only.")
         return CarbonResult(
             status="ok",
             answer=answer,
@@ -465,10 +485,7 @@ class CarbonQueryEngine:
                 f"Boundary: {boundary}",
                 f"Fallback usage ratio: {fallback_ratio:.2f}",
             ],
-            caveats=[
-                "Confidence reflects inventory evidence quality and assumption strength.",
-                "Operational recommendations should be combined with local fuel and engine records when available.",
-            ],
+            caveats=caveats,
             boundary=boundary,
             pollutants=pollutants_list,
             source_label=source_label,
@@ -561,13 +578,16 @@ class CarbonQueryEngine:
             "assumptions": payload,
         }
         export_csv, export_json = self._write_exports("carbon_estimate", row, payload_out)
+        caveats = ["Estimate is scenario-based and not a direct measured inventory."]
+        if not export_csv or not export_json:
+            caveats.append("Export files were skipped because runtime storage is read-only.")
         return CarbonResult(
             status="ok",
             answer=answer,
             table=row,
             chart=None,
             coverage_notes=["Mode: " + mode, "Boundary: " + boundary, "Assumptions provided explicitly."],
-            caveats=["Estimate is scenario-based and not a direct measured inventory."],
+            caveats=caveats,
             boundary=boundary,
             pollutants=pollutants,
             source_label=payload_out["source_label"],
