@@ -1,0 +1,167 @@
+{
+  "version": "eagleeye-carbon-v1.0.0",
+  "published_at": "2026-03-16",
+  "assumptions": {
+    "sox_multiplier": 2.0,
+    "default_fuel": "MGO",
+    "default_engine_family": "medium_speed_diesel"
+  },
+  "uncertainty_defaults": {
+    "speed_rel_sigma": 0.08,
+    "sfc_rel_sigma": 0.10,
+    "factor_rel_sigma": 0.08,
+    "interpolation_penalty_sigma": 0.10,
+    "gap_penalty_sigma": 0.08,
+    "fallback_penalty_sigma": 0.12
+  },
+  "fuel_factors": {
+    "MGO": {
+      "co2_t_per_t_fuel": 3.206,
+      "wtt_co2e_t_per_t_fuel": 0.62
+    },
+    "HFO": {
+      "co2_t_per_t_fuel": 3.114,
+      "wtt_co2e_t_per_t_fuel": 0.74
+    },
+    "LNG": {
+      "co2_t_per_t_fuel": 2.750,
+      "wtt_co2e_t_per_t_fuel": 1.05
+    },
+    "MDO": {
+      "co2_t_per_t_fuel": 3.190,
+      "wtt_co2e_t_per_t_fuel": 0.66
+    }
+  },
+  "mode_defaults": {
+    "aux_power_kw": {
+      "transit": {
+        "tanker": 900,
+        "cargo": 700,
+        "container": 850,
+        "passenger": 1200,
+        "service": 450,
+        "unknown": 600
+      },
+      "manoeuvring": {
+        "tanker": 1250,
+        "cargo": 950,
+        "container": 1150,
+        "passenger": 1500,
+        "service": 650,
+        "unknown": 850
+      },
+      "berth": {
+        "tanker": 650,
+        "cargo": 550,
+        "container": 700,
+        "passenger": 1100,
+        "service": 350,
+        "unknown": 500
+      },
+      "anchorage": {
+        "tanker": 520,
+        "cargo": 460,
+        "container": 560,
+        "passenger": 900,
+        "service": 320,
+        "unknown": 420
+      }
+    },
+    "sfc_main_g_per_kwh": {
+      "transit": 185,
+      "manoeuvring": 195,
+      "berth": 0,
+      "anchorage": 0
+    },
+    "sfc_aux_g_per_kwh": {
+      "transit": 210,
+      "manoeuvring": 215,
+      "berth": 220,
+      "anchorage": 220
+    },
+    "sulfur_fraction": {
+      "transit": 0.0010,
+      "manoeuvring": 0.0015,
+      "berth": 0.0010,
+      "anchorage": 0.0012
+    }
+  },
+  "vessel_defaults": {
+    "tanker": {
+      "mcr_kw": 12000,
+      "ref_speed_kn": 13.0,
+      "fuel": "HFO",
+      "engine_family": "slow_speed_diesel"
+    },
+    "cargo": {
+      "mcr_kw": 9000,
+      "ref_speed_kn": 12.5,
+      "fuel": "MGO",
+      "engine_family": "medium_speed_diesel"
+    },
+    "container": {
+      "mcr_kw": 15000,
+      "ref_speed_kn": 17.0,
+      "fuel": "HFO",
+      "engine_family": "slow_speed_diesel"
+    },
+    "passenger": {
+      "mcr_kw": 18000,
+      "ref_speed_kn": 19.0,
+      "fuel": "MGO",
+      "engine_family": "medium_speed_diesel"
+    },
+    "service": {
+      "mcr_kw": 3500,
+      "ref_speed_kn": 10.0,
+      "fuel": "MDO",
+      "engine_family": "high_speed_diesel"
+    },
+    "unknown": {
+      "mcr_kw": 8000,
+      "ref_speed_kn": 12.0,
+      "fuel": "MGO",
+      "engine_family": "medium_speed_diesel"
+    }
+  },
+  "nox_kg_per_t_fuel_by_engine_mode": {
+    "slow_speed_diesel": {
+      "transit": 65.0,
+      "manoeuvring": 62.0,
+      "berth": 38.0,
+      "anchorage": 41.0
+    },
+    "medium_speed_diesel": {
+      "transit": 55.0,
+      "manoeuvring": 53.0,
+      "berth": 34.0,
+      "anchorage": 37.0
+    },
+    "high_speed_diesel": {
+      "transit": 45.0,
+      "manoeuvring": 43.0,
+      "berth": 28.0,
+      "anchorage": 30.0
+    }
+  },
+  "pm_kg_per_t_fuel_by_engine_mode": {
+    "slow_speed_diesel": {
+      "transit": 1.60,
+      "manoeuvring": 1.55,
+      "berth": 1.20,
+      "anchorage": 1.25
+    },
+    "medium_speed_diesel": {
+      "transit": 1.30,
+      "manoeuvring": 1.25,
+      "berth": 1.00,
+      "anchorage": 1.05
+    },
+    "high_speed_diesel": {
+      "transit": 0.95,
+      "manoeuvring": 0.90,
+      "berth": 0.75,
+      "anchorage": 0.80
+    }
+  }
+}

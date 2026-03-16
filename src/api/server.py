@@ -8,9 +8,10 @@ from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
 
 import pandas as pd
-from fastapi import FastAPI
+from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
+from src.carbon.query import CarbonQueryEngine, CarbonResult
 from src.forecast.forecast import ForecastEngine, ForecastResult
 from src.kpi.query import AnalyticsResult, KPIQueryEngine
 from src.qa.intent import IntentResult, classify_question
@@ -34,6 +35,20 @@ class AskRequest(BaseModel):
     question: str = Field(..., min_length=1)
     top_k_evidence: int = Field(default=5, ge=1, le=10)
     filters: AskFiltersPayload = Field(default_factory=AskFiltersPayload)
+
+
+class CarbonEstimateRequest(BaseModel):
+    vessel_type: Optional[str] = None
+    mode: str = "transit"
+    duration_h: float = Field(default=1.0, gt=0.0, le=240.0)
+    speed_kn: float = Field(default=10.0, ge=0.0, le=60.0)
+    mcr_kw: Optional[float] = Field(default=None, gt=0.0)
+    ref_speed_kn: Optional[float] = Field(default=None, gt=0.0)
+    aux_power_kw: Optional[float] = Field(default=None, ge=0.0)
+    fuel_type: Optional[str] = None
+    engine_family: Optional[str] = None
+    boundary: str = "TTW"
+    pollutants: Optional[List[str]] = None
 
 
 @dataclass
@@ -232,8 +247,27 @@ def _retrieve_evidence_api(
     return EvidenceBundle(lines=lines, rows=rows, trace=trace)
 
 
-def _fallback_evidence_from_result(value: Union[AnalyticsResult, ForecastResult], max_items: int = 5) -> List[str]:
+def _fallback_evidence_from_result(
+    value: Union[AnalyticsResult, ForecastResult, CarbonResult],
+    max_items: int = 5,
+) -> List[str]:
     lines: List[str] = []
+    if isinstance(value, CarbonResult):
+        for eid in (value.evidence_ids or [])[:max_items]:
+            lines.append(f"carbon_evidence_id={eid}")
+        if value.table is not None and not value.table.empty:
+            head = value.table.head(min(3, max_items))
+            for _, row in head.iterrows():
+                tokens = []
+                for col in head.columns[:4]:
+                    cell = row[col]
+                    if pd.isna(cell):
+                        continue
+                    tokens.append(f"{col}={cell}")
+                if tokens:
+                    lines.append(" | ".join(tokens))
+        return lines[:max_items]
+
     if isinstance(value, ForecastResult):
         anchor_values_note = next((n for n in value.coverage_notes if n.startswith("Analog values used:")), None)
         anchor_dates_note = next((n for n in value.coverage_notes if n.startswith("Analog dates used:")), None)
@@ -267,7 +301,9 @@ def _fallback_evidence_from_result(value: Union[AnalyticsResult, ForecastResult]
     return lines[:max_items]
 
 
-def _extract_confidence_label(value: Union[AnalyticsResult, ForecastResult]) -> str:
+def _extract_confidence_label(value: Union[AnalyticsResult, ForecastResult, CarbonResult]) -> str:
+    if isinstance(value, CarbonResult):
+        return f"{value.confidence_label} ({value.confidence_reason})"
     if value.status != "ok":
         return "low (insufficient matched data/evidence)"
     for note in value.caveats:
@@ -278,8 +314,19 @@ def _extract_confidence_label(value: Union[AnalyticsResult, ForecastResult]) -> 
     return "medium (deterministic aggregation over filtered rows)"
 
 
-def _build_method_steps(value: Union[AnalyticsResult, ForecastResult]) -> List[str]:
+def _build_method_steps(value: Union[AnalyticsResult, ForecastResult, CarbonResult]) -> List[str]:
     steps: List[str] = []
+    if isinstance(value, CarbonResult):
+        steps.append("Applied deterministic AIS + port-call mode segmentation (transit/manoeuvring/berth/anchorage).")
+        steps.append(f"Boundary: {value.boundary}; Pollutants: {', '.join(value.pollutants)}.")
+        steps.append(f"Source label: {value.source_label}.")
+        steps.append(f"Confidence: {value.confidence_label} ({value.confidence_reason})")
+        if value.params_version:
+            steps.append(f"Factor registry version: {value.params_version}.")
+        for note in value.coverage_notes[:6]:
+            steps.append(note)
+        return steps
+
     if isinstance(value, ForecastResult):
         steps.append("Applied active filters (port/date/vessel-type) to congestion history.")
         for note in value.coverage_notes:
@@ -315,8 +362,25 @@ def _build_method_steps(value: Union[AnalyticsResult, ForecastResult]) -> List[s
     return out
 
 
-def _build_port_actions(value: Union[AnalyticsResult, ForecastResult]) -> List[str]:
+def _build_port_actions(value: Union[AnalyticsResult, ForecastResult, CarbonResult]) -> List[str]:
     actions: List[str] = []
+    if isinstance(value, CarbonResult):
+        metric = value.uncertainty_interval.get("CO2e") or value.uncertainty_interval.get("CO2") or {}
+        point = float(metric.get("point", 0.0))
+        upper = float(metric.get("upper", point))
+        if point >= 50:
+            actions.append("Prioritize shore-power and berth energy optimization on the highest-emitting call windows.")
+            actions.append("Coordinate speed and arrival windows with pilots to reduce manoeuvring fuel burn.")
+        elif point >= 15:
+            actions.append("Apply targeted slow-steaming and auxiliary-load management for vessels in this corridor.")
+            actions.append("Flag high-intensity days for emissions-aware berth allocation.")
+        else:
+            actions.append("Keep baseline operating plan; monitor for drift against this emissions baseline.")
+        if upper > point * 1.4:
+            actions.append("Uncertainty is wide; refresh with updated AIS coverage before operational decisions.")
+        actions.append("Use evidence IDs in technical audit mode to validate factor/fallback assumptions.")
+        return actions
+
     if isinstance(value, ForecastResult) and value.forecast is not None and not value.forecast.empty:
         pred = float(value.forecast["predicted"].mean())
         upper = float(value.forecast["upper"].mean()) if "upper" in value.forecast.columns else pred
@@ -364,8 +428,10 @@ def _serialize_chart(chart: Optional[pd.DataFrame]) -> Optional[List[Dict[str, A
     return records
 
 
-def _pick_chart(value: Union[AnalyticsResult, ForecastResult]) -> Optional[pd.DataFrame]:
+def _pick_chart(value: Union[AnalyticsResult, ForecastResult, CarbonResult]) -> Optional[pd.DataFrame]:
     if isinstance(value, AnalyticsResult):
+        return value.chart
+    if isinstance(value, CarbonResult):
         return value.chart
     if value.forecast is not None and not value.forecast.empty:
         return value.forecast
@@ -379,12 +445,13 @@ def _handle_ask_question_api(
     intent_result: IntentResult,
     kpi: KPIQueryEngine,
     forecaster: ForecastEngine,
+    carbon: CarbonQueryEngine,
     retriever: Optional[RAGRetriever],
     retriever_reason: str,
     top_k_evidence: int,
     user_filters: Dict[str, Any],
     events_path: Optional[Path],
-) -> tuple[Union[AnalyticsResult, ForecastResult], EvidenceBundle]:
+) -> tuple[Union[AnalyticsResult, ForecastResult, CarbonResult], EvidenceBundle]:
     entities = intent_result.entities
     q_lower = question.lower()
 
@@ -405,6 +472,21 @@ def _handle_ask_question_api(
         return KPIQueryEngine.unsupported(
             "This question needs terminal operations data (berth/crane/TEU/gate), which is not in PRJ912/PRJ896."
         ), EvidenceBundle(lines=[], rows=[], trace={})
+
+    if intent_result.intent == "H":
+        result = carbon.from_question_entities(question=question, entities=entities, user_filters=user_filters)
+        evidence = _retrieve_evidence_api(
+            retriever,
+            retriever_reason,
+            question,
+            entities,
+            user_filters,
+            top_k_evidence,
+            True,
+        )
+        if result.status == "ok" and evidence.rows:
+            result.source_label = "Hybrid (computed + retrieved supporting evidence)"
+        return result, evidence
 
     if intent_result.intent == "A":
         if "top" in q_lower and "port" in q_lower:
@@ -526,10 +608,10 @@ def _handle_ask_question_api(
 
 
 def _serialize_result(
-    result: Union[AnalyticsResult, ForecastResult],
+    result: Union[AnalyticsResult, ForecastResult, CarbonResult],
     evidence: EvidenceBundle,
 ) -> Dict[str, Any]:
-    return {
+    payload: Dict[str, Any] = {
         "status": result.status,
         "answer": result.answer,
         "confidence": _extract_confidence_label(result),
@@ -545,12 +627,28 @@ def _serialize_result(
         "chart": _serialize_chart(_pick_chart(result)),
         "retrieval_provenance": evidence.trace,
     }
+    if isinstance(result, CarbonResult):
+        payload["carbon"] = {
+            "boundary": result.boundary,
+            "pollutants": result.pollutants,
+            "source_label": result.source_label,
+            "confidence_label": result.confidence_label,
+            "confidence_reason": result.confidence_reason,
+            "uncertainty_interval": result.uncertainty_interval,
+            "params_version": result.params_version,
+            "evidence_ids": result.evidence_ids,
+            "segment_ids": result.segment_ids,
+            "export_csv_path": result.export_csv_path,
+            "export_json_path": result.export_json_path,
+        }
+    return payload
 
 
 def _build_state() -> Dict[str, Any]:
     config_path = "config/config.yaml"
     config = load_config(config_path)
     configured_processed_dir = Path(config.get("predict", {}).get("processed_dir", "data/processed"))
+    carbon_cfg = config.get("carbon", {})
     _maybe_bootstrap_bundle(
         "APP_PROCESSED_BUNDLE_URL",
         configured_processed_dir,
@@ -592,6 +690,12 @@ def _build_state() -> Dict[str, Any]:
 
     kpi_engine = KPIQueryEngine(processed_dir=processed_dir)
     forecast_engine = ForecastEngine(processed_dir=processed_dir)
+    carbon_engine = CarbonQueryEngine(
+        processed_dir=processed_dir,
+        factor_registry_path=carbon_cfg.get("factor_registry_path", "config/carbon_factors.v1.json"),
+        monte_carlo_draws=int(carbon_cfg.get("monte_carlo_draws", 500)),
+        auto_build=True,
+    )
 
     retriever = None
     retriever_reason = ""
@@ -645,6 +749,7 @@ def _build_state() -> Dict[str, Any]:
         "chroma_bootstrap_message": chroma_bootstrap_message,
         "kpi": kpi_engine,
         "forecast": forecast_engine,
+        "carbon": carbon_engine,
         "retriever": retriever,
         "retriever_reason": retriever_reason,
         "events_path": str(events_path),
@@ -682,6 +787,8 @@ def health() -> Dict[str, Any]:
         "chroma_bootstrap_message": state["chroma_bootstrap_message"],
         "retriever_reason": state["retriever_reason"],
         "events_available": bool(Path(state["events_path"]).exists()),
+        "carbon_available": bool(state["carbon"].available),
+        "carbon_params_version": state["carbon"].params_version.get("version"),
     }
 
 
@@ -692,6 +799,10 @@ def root() -> Dict[str, Any]:
         "docs": "/docs",
         "health": "/health",
         "ask": "/ask",
+        "carbon_ports": "/api/v1/carbon/ports/{port_id}/emissions",
+        "carbon_call": "/api/v1/carbon/vessels/{mmsi}/calls/{call_id}",
+        "carbon_estimate": "/api/v1/carbon/estimate",
+        "carbon_evidence": "/api/v1/carbon/evidence/{evidence_id}",
     }
 
 
@@ -706,6 +817,7 @@ def ask(req: AskRequest) -> Dict[str, Any]:
         intent_result=intent_result,
         kpi=state["kpi"],
         forecaster=state["forecast"],
+        carbon=state["carbon"],
         retriever=state["retriever"],
         retriever_reason=state["retriever_reason"],
         top_k_evidence=req.top_k_evidence,
@@ -717,3 +829,74 @@ def ask(req: AskRequest) -> Dict[str, Any]:
         "intent": asdict(intent_result),
         "result": _serialize_result(result, evidence),
     }
+
+
+def _parse_pollutants_query(value: Optional[str]) -> List[str]:
+    if not value:
+        return ["CO2", "NOx", "SOx", "PM"]
+    items = [v.strip() for v in str(value).split(",") if v.strip()]
+    return items or ["CO2", "NOx", "SOx", "PM"]
+
+
+@app.get("/api/v1/carbon/ports/{port_id}/emissions")
+def carbon_port_emissions(
+    port_id: str,
+    from_date: Optional[str] = Query(default=None, alias="from"),
+    to_date: Optional[str] = Query(default=None, alias="to"),
+    group_by: str = Query(default="day"),
+    boundary: str = Query(default="TTW"),
+    pollutants: Optional[str] = Query(default=None),
+) -> Dict[str, Any]:
+    state = _runtime_state()
+    engine: CarbonQueryEngine = state["carbon"]
+    result = engine.query_port_emissions(
+        port_id=port_id,
+        date_from=from_date,
+        date_to=to_date,
+        group_by=group_by,
+        boundary=boundary,
+        pollutants=_parse_pollutants_query(pollutants),
+        include_uncertainty=True,
+        include_evidence=True,
+    )
+    return {"port_id": port_id, "result": _serialize_result(result, EvidenceBundle(lines=[], rows=[], trace={}))}
+
+
+@app.get("/api/v1/carbon/vessels/{mmsi}/calls/{call_id}")
+def carbon_vessel_call(
+    mmsi: str,
+    call_id: str,
+    boundary: str = Query(default="TTW"),
+    pollutants: Optional[str] = Query(default=None),
+    include_uncertainty: bool = Query(default=True),
+    include_evidence: bool = Query(default=True),
+) -> Dict[str, Any]:
+    state = _runtime_state()
+    engine: CarbonQueryEngine = state["carbon"]
+    result = engine.query_vessel_call(
+        mmsi=mmsi,
+        call_id=call_id,
+        boundary=boundary,
+        pollutants=_parse_pollutants_query(pollutants),
+        include_uncertainty=include_uncertainty,
+        include_evidence=include_evidence,
+    )
+    return {"mmsi": mmsi, "call_id": call_id, "result": _serialize_result(result, EvidenceBundle(lines=[], rows=[], trace={}))}
+
+
+@app.post("/api/v1/carbon/estimate")
+def carbon_estimate(req: CarbonEstimateRequest) -> Dict[str, Any]:
+    state = _runtime_state()
+    engine: CarbonQueryEngine = state["carbon"]
+    result = engine.estimate_with_assumptions(req.model_dump())
+    return {"result": _serialize_result(result, EvidenceBundle(lines=[], rows=[], trace={}))}
+
+
+@app.get("/api/v1/carbon/evidence/{evidence_id}")
+def carbon_evidence(evidence_id: str) -> Dict[str, Any]:
+    state = _runtime_state()
+    engine: CarbonQueryEngine = state["carbon"]
+    payload = engine.get_evidence(evidence_id)
+    if payload.get("status") != "ok":
+        raise HTTPException(status_code=404, detail=payload.get("reason", "Evidence not found"))
+    return payload

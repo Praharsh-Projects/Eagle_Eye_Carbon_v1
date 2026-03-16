@@ -1,13 +1,14 @@
-# Eagle Eye Congestion Analytics + Forecast + RAG Evidence
+# Eagle Eye Congestion + Carbon + Forecast + RAG Evidence
 
 This project uses:
 - `PRJ912.csv` (AIS telemetry)
 - `PRJ896.csv` (port calls)
 - Optional docs (NIS2 PDF + public ISPS pages)
 
-It now has two layers:
+It now has three layers:
 1. Deterministic analytics/forecast (source of truth for counts, congestion, trends)
-2. Optional RAG evidence (representative examples, not numeric truth)
+2. Deterministic carbon inventory (TTW pollutants + WTW CO2e, with uncertainty + provenance)
+3. Optional RAG evidence (representative examples, not numeric truth)
 
 ## 0) Recommended Free Deployment
 
@@ -92,8 +93,9 @@ For ISPS, prefer public official pages via URLs, not unofficial full-text PDFs.
 This runs, in order:
 1. `src.predict.data_prep`
 2. `src.kpi.build_kpis`
-3. destination / ETA / anomaly training
-4. RAG indexing (if `OPENAI_API_KEY` is set)
+3. `src.carbon.build`
+4. destination / ETA / anomaly training
+5. RAG indexing (if `OPENAI_API_KEY` is set)
 
 ## 4) Manual Commands
 
@@ -120,6 +122,21 @@ Outputs include:
 - `data/processed/occupancy_hourly.parquet`
 - `data/processed/congestion_daily.parquet`
 - `data/processed/kpi_capabilities.json`
+
+### Build carbon layer outputs (TTW + WTW + uncertainty + evidence)
+```bash
+python -m src.carbon.build \
+  --processed_dir data/processed \
+  --out_dir data/processed
+```
+
+Outputs include:
+- `data/processed/carbon_segments.parquet`
+- `data/processed/carbon_emissions_segment.parquet`
+- `data/processed/carbon_emissions_daily_port.parquet`
+- `data/processed/carbon_emissions_call.parquet`
+- `data/processed/carbon_evidence.parquet`
+- `data/processed/carbon_params_version.json`
 
 ### Train prediction models
 ```bash
@@ -223,6 +240,7 @@ If dwell is unavailable, congestion falls back to arrivals-only ratio.
 
 Supported well:
 - arrivals volume, busiest day/hour, dwell proxy, congestion proxy, historical-pattern forecasts
+- TTW pollutants (`CO2`, `NOx`, `SOx`, `PM`) and WTW `CO2e` with confidence + uncertainty intervals
 
 Out of scope (clean refusal):
 - berth crane utilization
@@ -237,6 +255,8 @@ Out of scope (clean refusal):
 - `What will congestion look like next Friday at LUBECK?`
 - `Why was LVVNT congested on 2021-01-01?`
 - `Any unusual spikes in arrivals at GDANSK in 2021-02?`
+- `What are TTW emissions at SEGOT in March 2022 for CO2, NOx, SOx, and PM?`
+- `Show WTW CO2e emissions at LVVNT between 2022-02-01 and 2022-02-28.`
 
 ## 9) Troubleshooting
 

@@ -55,3 +55,13 @@ forecast:
   default_horizon_weeks: 4
   min_history_days: 60
   backtest_days: 28
+
+carbon:
+  factor_registry_path: config/carbon_factors.v1.json
+  monte_carlo_draws: 500
+  default_boundary: TTW
+  default_pollutants:
+    - CO2
+    - NOx
+    - SOx
+    - PM

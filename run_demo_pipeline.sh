@@ -44,33 +44,38 @@ run_with_optional_limit python -m src.kpi.build_kpis \
   "${csv_args[@]}" \
   --out_dir data/processed
 
-echo "[3/7] Training destination model..."
+echo "[3/8] Building carbon layer datasets..."
+python -m src.carbon.build \
+  --processed_dir data/processed \
+  --out_dir data/processed
+
+echo "[4/8] Training destination model..."
 python -m src.predict.train_destination \
   --training_rows data/processed/training_rows.parquet \
   --model_dir models
 
-echo "[4/7] Training ETA model..."
+echo "[5/8] Training ETA model..."
 python -m src.predict.train_eta \
   --training_rows data/processed/training_rows.parquet \
   --model_dir models
 
-echo "[5/7] Training anomaly model..."
+echo "[6/8] Training anomaly model..."
 python -m src.predict.anomaly \
   --training_rows data/processed/training_rows.parquet \
   --model_dir models
 
-echo "[6/7] Running forecast backtest..."
+echo "[7/8] Running forecast backtest..."
 python -m src.forecast.backtest \
   --processed_dir data/processed \
   --out data/processed/forecast_backtest.json
 
 if [[ -z "${OPENAI_API_KEY:-}" ]]; then
-  echo "[7/7] OPENAI_API_KEY is not set. Skipping RAG index build."
+  echo "[8/8] OPENAI_API_KEY is not set. Skipping RAG index build."
   echo "Set OPENAI_API_KEY and rerun to index traffic/docs into Chroma."
   exit 0
 fi
 
-echo "[7/7] Building Chroma index (traffic + docs)..."
+echo "[8/8] Building Chroma index (traffic + docs)..."
 pdf_args=()
 if [[ -f "$PDF_NIS2" ]]; then
   pdf_args+=("$PDF_NIS2")

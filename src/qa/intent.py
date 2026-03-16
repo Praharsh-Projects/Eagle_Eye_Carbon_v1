@@ -22,7 +22,8 @@ DOW_TITLE = {name: name.title() for name in DOW_NAMES}
 
 UNSUPPORTED_KEYWORDS = (
     "crane",
-    "berth",
+    "berth utilization",
+    "berth productivity",
     "teu",
     "throughput",
     "gate queue",
@@ -51,6 +52,21 @@ FORECAST_KEYWORDS = (
     "coming",
     "future",
     "will",
+)
+
+CARBON_KEYWORDS = (
+    "carbon",
+    "emission",
+    "emissions",
+    "co2",
+    "co2e",
+    "nox",
+    "sox",
+    "pm",
+    "tank-to-wake",
+    "ttw",
+    "well-to-wake",
+    "wtw",
 )
 
 COMPARE_KEYWORDS = (
@@ -151,6 +167,7 @@ LAST_WEEKS_RE = re.compile(r"\blast\s+(\d{1,2})\s+weeks?\b", re.IGNORECASE)
 HORIZON_WEEKS_RE = re.compile(r"\b(\d{1,2})\s+weeks?\b", re.IGNORECASE)
 MMSI_RE = re.compile(r"\bmmsi\s*[:#]?\s*(\d{6,9})\b", re.IGNORECASE)
 IMO_RE = re.compile(r"\bimo\s*[:#]?\s*(\d{6,8})\b", re.IGNORECASE)
+CALL_ID_RE = re.compile(r"\bcall[_\-\s]?id\s*[:=]?\s*([A-Za-z0-9_\-:.]+)\b", re.IGNORECASE)
 LONG_DATE_RE = re.compile(
     r"\b(?:on\s+)?(?:(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s*,?\s*)?"
     r"(january|february|march|april|may|june|july|august|september|october|november|december)\s+"
@@ -205,6 +222,33 @@ def _extract_vessel_type(question: str) -> Optional[str]:
     if "container" in q:
         return "container ship"
     return None
+
+
+def _extract_carbon_boundary(question: str) -> str:
+    q = question.lower()
+    if any(token in q for token in ("wtw", "well-to-wake", "well to wake", "lifecycle", "co2e")):
+        return "WTW"
+    return "TTW"
+
+
+def _extract_carbon_pollutants(question: str) -> List[str]:
+    q = question.lower()
+    out: List[str] = []
+    if "co2e" in q or "ghg" in q:
+        out.append("CO2e")
+    if re.search(r"\bco2\b", q) and "CO2" not in out:
+        out.append("CO2")
+    if "nox" in q:
+        out.append("NOx")
+    if "sox" in q or "sulfur" in q:
+        out.append("SOx")
+    if re.search(r"\bpm\b", q) or "particulate" in q:
+        out.append("PM")
+    if any(token in q for token in ("pollutant", "pollutants", "emissions")) and not out:
+        out = ["CO2", "NOx", "SOx", "PM"]
+    if not out:
+        out = ["CO2", "NOx", "SOx", "PM"]
+    return out
 
 
 def _extract_ports(question: str) -> List[str]:
@@ -372,6 +416,9 @@ def classify_question(question: str) -> IntentResult:
         "horizon_weeks": _extract_horizon_weeks(question),
         "mmsi": None,
         "imo": None,
+        "call_id": None,
+        "boundary": _extract_carbon_boundary(question),
+        "pollutants": _extract_carbon_pollutants(question),
     }
 
     if entities["ports"]:
@@ -383,12 +430,22 @@ def classify_question(question: str) -> IntentResult:
     imo_hit = IMO_RE.search(question)
     if imo_hit:
         entities["imo"] = imo_hit.group(1)
+    call_hit = CALL_ID_RE.search(question)
+    if call_hit:
+        entities["call_id"] = call_hit.group(1)
 
     if any(token in q for token in UNSUPPORTED_KEYWORDS):
         return IntentResult(
             intent="G",
             entities=entities,
             reason="Requested metric requires terminal operational data outside AIS/port-call scope.",
+        )
+
+    if any(token in q for token in CARBON_KEYWORDS):
+        return IntentResult(
+            intent="H",
+            entities=entities,
+            reason="Carbon/emissions inventory request detected.",
         )
 
     if any(token in q for token in ANOMALY_KEYWORDS):
@@ -421,6 +478,7 @@ def describe_intent(intent: str) -> str:
         "E": "Diagnostic",
         "F": "Anomaly",
         "G": "Unsupported",
+        "H": "Carbon Inventory",
     }
     return names.get(intent, "Unknown")
 
@@ -434,5 +492,13 @@ def required_data_for_intent(intent: str) -> List[str]:
         "E": ["arrivals_daily.parquet", "dwell_time.parquet"],
         "F": ["arrivals_daily.parquet"],
         "G": [],
+        "H": [
+            "carbon_segments.parquet",
+            "carbon_emissions_segment.parquet",
+            "carbon_emissions_daily_port.parquet",
+            "carbon_emissions_call.parquet",
+            "carbon_evidence.parquet",
+            "carbon_params_version.json",
+        ],
     }
     return mapping.get(intent, [])

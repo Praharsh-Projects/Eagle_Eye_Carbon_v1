@@ -181,6 +181,10 @@ fi
 
 require_file "${ROOT_DIR}/data/processed/arrivals_daily.parquet"
 require_file "${ROOT_DIR}/data/processed/events.parquet"
+require_file "${ROOT_DIR}/data/processed/carbon_emissions_daily_port.parquet"
+require_file "${ROOT_DIR}/data/processed/carbon_emissions_call.parquet"
+require_file "${ROOT_DIR}/data/processed/carbon_evidence.parquet"
+require_file "${ROOT_DIR}/data/processed/carbon_params_version.json"
 require_file "${ROOT_DIR}/data/chroma/chroma.sqlite3"
 require_file "${ROOT_DIR}/data/chroma/traffic_metadata_index.csv"
 

@@ -19,6 +19,7 @@ except Exception:  # pragma: no cover - optional visualization dependency
     alt = None
 
 from src.forecast.forecast import ForecastEngine, ForecastResult
+from src.carbon.query import CarbonQueryEngine, CarbonResult
 from src.kpi.query import AnalyticsResult, KPIQueryEngine
 from src.qa.intent import IntentResult, classify_question
 from src.rag.retriever import QueryFilters, RAGRetriever
@@ -45,6 +46,11 @@ SAMPLE_QUERIES_BY_CATEGORY: Dict[str, List[str]] = {
         "Expected congestion at GDANSK on 2026-03-06?",
         "Compare expected congestion next Friday between LVVNT and SEGOT.",
         "Predict whether LUBECK is likely high congestion on 2026-02-20.",
+    ],
+    "Carbon & Emissions": [
+        "What are TTW emissions at SEGOT in March 2022 for CO2, NOx, SOx, and PM?",
+        "Show WTW CO2e emissions at LVVNT between 2022-02-01 and 2022-02-28.",
+        "Carbon emissions for SEGOT by month in 2022.",
     ],
     "Unsupported Scope": [
         "What is crane utilization at berth 3 in SEGOT today?",
@@ -82,6 +88,16 @@ def _init_kpi_engine(processed_dir: str) -> KPIQueryEngine:
 @st.cache_resource
 def _init_forecast_engine(processed_dir: str) -> ForecastEngine:
     return ForecastEngine(processed_dir=processed_dir)
+
+
+@st.cache_resource
+def _init_carbon_engine(processed_dir: str, factor_registry_path: str, monte_carlo_draws: int) -> CarbonQueryEngine:
+    return CarbonQueryEngine(
+        processed_dir=processed_dir,
+        factor_registry_path=factor_registry_path,
+        monte_carlo_draws=monte_carlo_draws,
+        auto_build=True,
+    )
 
 
 @st.cache_resource
@@ -336,9 +352,19 @@ def _resolve_ports(port_tokens: List[str], kpi: KPIQueryEngine) -> List[str]:
 
 
 def _derive_answer_source(
-    result: Union[AnalyticsResult, ForecastResult],
+    result: Union[AnalyticsResult, ForecastResult, CarbonResult],
     evidence: EvidenceBundle,
 ) -> tuple[str, str]:
+    if isinstance(result, CarbonResult):
+        label = result.source_label
+        if evidence.rows and label.startswith("Computed"):
+            label = "Hybrid (computed + retrieved supporting evidence)"
+        detail = (
+            "Carbon metrics are deterministic inventory outputs from AIS + port-call segmentation. "
+            "Vector retrieval is optional supporting evidence."
+        )
+        return label, detail
+
     data_source_note = next(
         (n for n in result.coverage_notes if n.startswith("Data sources used:")),
         "",
@@ -622,11 +648,12 @@ def _handle_ask_question(
     intent_result: IntentResult,
     kpi: KPIQueryEngine,
     forecaster: ForecastEngine,
+    carbon: CarbonQueryEngine,
     retriever: Optional[RAGRetriever],
     top_k_evidence: int,
     user_filters: Dict[str, Any],
     events_path: Optional[Path],
-) -> tuple[Union[AnalyticsResult, ForecastResult], EvidenceBundle]:
+) -> tuple[Union[AnalyticsResult, ForecastResult, CarbonResult], EvidenceBundle]:
     entities = intent_result.entities
     q_lower = question.lower()
 
@@ -666,6 +693,20 @@ def _handle_ask_question(
             ),
             EvidenceBundle(lines=[], rows=[], trace={}),
         )
+
+    if intent_result.intent == "H":
+        result = carbon.from_question_entities(question=question, entities=entities, user_filters=user_filters)
+        evidence = _retrieve_evidence(
+            retriever=retriever,
+            question=question,
+            entities=entities,
+            overrides=evidence_overrides,
+            top_k=top_k_evidence,
+            include_dates=True,
+        )
+        if result.status == "ok" and evidence.rows:
+            result.source_label = "Hybrid (computed + retrieved supporting evidence)"
+        return result, evidence
 
     if intent_result.intent == "A":
         if "top" in q_lower and "port" in q_lower:
@@ -912,15 +953,31 @@ def _handle_ask_question(
 
 
 def _render_compact_result(
-    result: Union[AnalyticsResult, ForecastResult],
+    result: Union[AnalyticsResult, ForecastResult, CarbonResult],
     evidence: EvidenceBundle,
     show_technical: bool,
 ) -> None:
     def _fallback_evidence_from_result(
-        value: Union[AnalyticsResult, ForecastResult],
+        value: Union[AnalyticsResult, ForecastResult, CarbonResult],
         max_items: int = 5,
     ) -> List[str]:
         lines: List[str] = []
+
+        if isinstance(value, CarbonResult):
+            for eid in (value.evidence_ids or [])[:max_items]:
+                lines.append(f"carbon_evidence_id={eid}")
+            if value.table is not None and not value.table.empty:
+                head = value.table.head(min(3, max_items))
+                for _, row in head.iterrows():
+                    tokens = []
+                    for col in head.columns[:4]:
+                        cell = row[col]
+                        if pd.isna(cell):
+                            continue
+                        tokens.append(f"{col}={cell}")
+                    if tokens:
+                        lines.append(" | ".join(tokens))
+            return lines[:max_items]
 
         if isinstance(value, ForecastResult):
             anchor_values_note = next(
@@ -977,7 +1034,9 @@ def _render_compact_result(
                     lines.append(" | ".join(fragments))
         return lines[:max_items]
 
-    def _extract_confidence_label(value: Union[AnalyticsResult, ForecastResult]) -> str:
+    def _extract_confidence_label(value: Union[AnalyticsResult, ForecastResult, CarbonResult]) -> str:
+        if isinstance(value, CarbonResult):
+            return f"{value.confidence_label} ({value.confidence_reason})"
         if value.status != "ok":
             return "low (insufficient matched data/evidence)"
         for note in value.caveats:
@@ -992,8 +1051,20 @@ def _render_compact_result(
             return line
         return line.split("|", maxsplit=3)[-1].strip()
 
-    def _build_recommendation_triggers(value: Union[AnalyticsResult, ForecastResult]) -> List[str]:
+    def _build_recommendation_triggers(value: Union[AnalyticsResult, ForecastResult, CarbonResult]) -> List[str]:
         triggers: List[str] = []
+        if isinstance(value, CarbonResult):
+            co2e = value.uncertainty_interval.get("CO2e") or value.uncertainty_interval.get("CO2")
+            if co2e:
+                triggers.append(
+                    f"Trigger: {value.boundary} {('CO2e' if 'CO2e' in value.uncertainty_interval else 'CO2')} point={co2e.get('point', 0):.2f}."
+                )
+                triggers.append(
+                    f"Trigger: uncertainty interval {co2e.get('lower', 0):.2f}-{co2e.get('upper', 0):.2f}."
+                )
+            triggers.append(f"Trigger: source label = {value.source_label}.")
+            return triggers
+
         if isinstance(value, ForecastResult) and value.forecast is not None and not value.forecast.empty:
             pred = float(value.forecast["predicted"].mean())
             upper = float(value.forecast["upper"].mean()) if "upper" in value.forecast.columns else pred
@@ -1036,8 +1107,18 @@ def _render_compact_result(
             triggers.append("Trigger: recommendation generated from filtered KPI summary for the selected window.")
         return triggers
 
-    def _build_method_steps(value: Union[AnalyticsResult, ForecastResult]) -> List[str]:
+    def _build_method_steps(value: Union[AnalyticsResult, ForecastResult, CarbonResult]) -> List[str]:
         steps: List[str] = []
+        if isinstance(value, CarbonResult):
+            steps.append("Applied deterministic AIS + port-call mode segmentation (transit/manoeuvring/berth/anchorage).")
+            steps.append(f"Boundary: {value.boundary}; Pollutants: {', '.join(value.pollutants)}.")
+            steps.append(f"Source label: {value.source_label}.")
+            steps.append(f"Factor params version: {value.params_version}.")
+            steps.append(f"Confidence: {value.confidence_label} ({value.confidence_reason})")
+            for note in value.coverage_notes[:6]:
+                steps.append(note)
+            return steps
+
         if isinstance(value, ForecastResult):
             steps.append("Applied active filters (port/date/vessel-type) to the congestion history for this query.")
             for note in value.coverage_notes:
@@ -1075,8 +1156,25 @@ def _render_compact_result(
                 deduped.append(step)
         return deduped
 
-    def _build_port_actions(value: Union[AnalyticsResult, ForecastResult]) -> List[str]:
+    def _build_port_actions(value: Union[AnalyticsResult, ForecastResult, CarbonResult]) -> List[str]:
         actions: List[str] = []
+        if isinstance(value, CarbonResult):
+            co2e = value.uncertainty_interval.get("CO2e") or value.uncertainty_interval.get("CO2")
+            point = float((co2e or {}).get("point", 0.0))
+            upper = float((co2e or {}).get("upper", point))
+            if point >= 50:
+                actions.append("Prioritize shore-power and berth energy optimization on high-emission windows.")
+                actions.append("Coordinate pilot/tug sequencing to reduce manoeuvring fuel intensity.")
+            elif point >= 15:
+                actions.append("Apply targeted slow-steaming and auxiliary-load controls for inbound traffic.")
+                actions.append("Use emissions view for berth allocation on high-intensity dates.")
+            else:
+                actions.append("Maintain baseline operations; monitor emissions drift against this baseline.")
+            if upper > point * 1.4:
+                actions.append("Uncertainty is wide: refresh with latest AIS coverage before final ops decisions.")
+            actions.append("Audit supporting evidence IDs before publishing inventory outputs externally.")
+            return actions
+
         if isinstance(value, ForecastResult) and value.forecast is not None and not value.forecast.empty:
             pred = float(value.forecast["predicted"].mean())
             upper = float(value.forecast["upper"].mean()) if "upper" in value.forecast.columns else pred
@@ -1115,7 +1213,7 @@ def _render_compact_result(
         return actions
 
     def _build_evidence_backed_answer(
-        value: Union[AnalyticsResult, ForecastResult],
+        value: Union[AnalyticsResult, ForecastResult, CarbonResult],
         bundle: EvidenceBundle,
     ) -> Optional[str]:
         if value.status == "ok" or not bundle.rows:
@@ -1144,8 +1242,35 @@ def _render_compact_result(
         parsed = pd.to_datetime(series, errors="coerce", utc=True)
         return parsed.dt.tz_convert(None)
 
-    def _render_chart(value: Union[AnalyticsResult, ForecastResult]) -> None:
+    def _render_chart(value: Union[AnalyticsResult, ForecastResult, CarbonResult]) -> None:
         st.subheader("Chart")
+
+        if isinstance(value, CarbonResult):
+            if value.chart is None or value.chart.empty:
+                st.info("No chartable carbon series for this response.")
+                return
+            chart_df = value.chart.copy()
+            if isinstance(chart_df.index, pd.DatetimeIndex):
+                plot_df = chart_df.reset_index().rename(columns={chart_df.index.name or "index": "x"})
+                plot_df["x"] = _to_naive_datetime(plot_df["x"]).dt.floor("D")
+                value_col = [c for c in plot_df.columns if c != "x"][0]
+                if alt is not None:
+                    line = (
+                        alt.Chart(plot_df.dropna(subset=["x"]))
+                        .mark_line(color="#22c55e", point=True)
+                        .encode(
+                            x=alt.X("x:T", title="Date"),
+                            y=alt.Y(f"{value_col}:Q", title=value_col),
+                            tooltip=["x:T", alt.Tooltip(f"{value_col}:Q", format=".3f")],
+                        )
+                        .properties(height=280)
+                    )
+                    st.altair_chart(line, use_container_width=True)
+                else:
+                    st.line_chart(chart_df, use_container_width=True)
+            else:
+                st.dataframe(chart_df, use_container_width=True, hide_index=True)
+            return
 
         if isinstance(value, ForecastResult):
             hist = pd.DataFrame()
@@ -1300,6 +1425,25 @@ def _render_compact_result(
     st.write(source_label)
     st.caption(source_detail)
 
+    if isinstance(result, CarbonResult):
+        st.subheader("Carbon Contract")
+        st.write(
+            f"Boundary: `{result.boundary}` | Pollutants: `{', '.join(result.pollutants)}` | "
+            f"Params version: `{result.params_version}`"
+        )
+        if result.uncertainty_interval:
+            rows = []
+            for key, payload in result.uncertainty_interval.items():
+                rows.append(
+                    {
+                        "metric": key,
+                        "point": float(payload.get("point", 0.0)),
+                        "lower": float(payload.get("lower", 0.0)),
+                        "upper": float(payload.get("upper", 0.0)),
+                    }
+                )
+            st.dataframe(pd.DataFrame(rows), width="stretch", hide_index=True)
+
     if isinstance(result, ForecastResult):
         meaning_note = next((n for n in result.coverage_notes if n.startswith("Meaning:")), None)
         if meaning_note:
@@ -1359,6 +1503,22 @@ def _render_compact_result(
         if where_used not in (None, "", {}):
             st.write(f"Where filter: `{where_used}`")
     if show_technical:
+        if isinstance(result, CarbonResult):
+            st.markdown("**Carbon technical audit**")
+            st.write(
+                f"params_version=`{result.params_version}` | "
+                f"confidence=`{result.confidence_label}` | "
+                f"reason=`{result.confidence_reason}`"
+            )
+            if result.evidence_ids:
+                st.write("Evidence IDs:", ", ".join(result.evidence_ids[:20]))
+            if result.segment_ids:
+                st.write("Segment IDs:", ", ".join(result.segment_ids[:20]))
+            if result.export_csv_path or result.export_json_path:
+                st.write(
+                    f"Exports: csv=`{result.export_csv_path or 'n/a'}`, "
+                    f"json=`{result.export_json_path or 'n/a'}`"
+                )
         if evidence.rows:
             trace_df = pd.DataFrame(evidence.rows)
             cols = [c for c in ["vector_id", "chunk_id", "distance", "timestamp", "port", "vessel_type", "mmsi"] if c in trace_df.columns]
@@ -1438,6 +1598,12 @@ def main() -> None:
     try:
         kpi_engine = _init_kpi_engine(str(default_processed_dir))
         forecast_engine = _init_forecast_engine(str(default_processed_dir))
+        carbon_cfg = config.get("carbon", {})
+        carbon_engine = _init_carbon_engine(
+            processed_dir=str(default_processed_dir),
+            factor_registry_path=str(carbon_cfg.get("factor_registry_path", "config/carbon_factors.v1.json")),
+            monte_carlo_draws=int(carbon_cfg.get("monte_carlo_draws", 500)),
+        )
     except Exception as exc:
         st.error(f"Could not initialize data engines: {exc}")
         st.info("Run `./run_demo_pipeline.sh` first.")
@@ -1487,6 +1653,10 @@ def main() -> None:
     with st.sidebar:
         if "Fell back to local vector store" in retriever_reason:
             st.warning(retriever_reason)
+        if getattr(carbon_engine, "available", False):
+            st.caption(f"Carbon layer active (params: {carbon_engine.params_version.get('version', 'unknown')}).")
+        else:
+            st.warning("Carbon layer artifacts not found. Build with `python -m src.carbon.build --processed_dir data/processed`.")
 
     st.session_state["retriever_reason"] = retriever_reason
     events_path = configured_processed_dir / "events.parquet"
@@ -1540,6 +1710,7 @@ def main() -> None:
         intent_result=intent_result,
         kpi=kpi_engine,
         forecaster=forecast_engine,
+        carbon=carbon_engine,
         retriever=retriever,
         top_k_evidence=top_k_evidence,
         user_filters=user_filters,
