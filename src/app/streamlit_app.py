@@ -720,6 +720,18 @@ def _handle_ask_question(
             top_k=top_k_evidence,
             include_dates=True,
         )
+        if (
+            any(token in q_lower for token in ("jump", "spoof", "teleport", "impossible"))
+            and result.table is not None
+            and not result.table.empty
+            and not evidence.rows
+        ):
+            trace = dict(evidence.trace or {})
+            trace["retrieval_status"] = "computed_only"
+            trace["reason"] = (
+                "Vector retrieval returned no hits; evidence is from row-level AIS jump computation."
+            )
+            evidence = EvidenceBundle(lines=evidence.lines, rows=evidence.rows, trace=trace)
         return result, evidence
 
     result = kpi.get_arrivals(port=port, start=start, end=end, vessel_type=vessel_type, dow=dow, window=window)
