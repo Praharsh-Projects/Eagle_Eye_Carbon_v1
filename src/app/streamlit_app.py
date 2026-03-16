@@ -5,6 +5,8 @@ from __future__ import annotations
 import time
 import os
 import re
+import unicodedata
+from difflib import SequenceMatcher
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Tuple, Union
@@ -27,18 +29,42 @@ from src.utils.runtime import chroma_remote_settings, force_local_vector_env
 from src.utils.serialization import compact_traffic_evidence
 
 
-SAMPLE_QUERIES = [
-    "How many vessel arrivals were recorded at SEGOT in March 2022?",
-    "Which weekday is usually busiest at LVVNT?",
-    "Compare Friday and Monday arrivals at GDANSK in March 2022.",
-    "Show suspicious AIS jumps for MMSI 246521000 on 2022-03-10.",
-    "For MMSI 266232000, summarize movement and destination changes on 2021-01-01.",
-    "What will congestion be at LVVNT on Friday, February 20, 2026?",
-    "Predict congestion for SEGOT next Friday based on historical patterns.",
-    "Expected congestion at GDANSK on 2026-03-06?",
-    "Compare expected congestion next Friday between LVVNT and SEGOT.",
-    "Predict whether LUBECK is likely high congestion on 2026-02-20.",
-]
+SAMPLE_QUERIES_BY_CATEGORY: Dict[str, List[str]] = {
+    "Traffic Monitoring": [
+        "How many vessel arrivals were recorded at SEGOT in March 2022?",
+        "Which weekday is usually busiest at LVVNT?",
+        "Compare Friday and Monday arrivals at GDANSK in March 2022.",
+    ],
+    "Vessel Investigation": [
+        "For MMSI 266232000, summarize movement and destination changes on 2021-01-01.",
+        "Show suspicious AIS jumps for MMSI 246521000 on 2022-03-10.",
+    ],
+    "Forecast Planning": [
+        "What will congestion be at LVVNT on Friday, February 20, 2026?",
+        "Predict congestion for SEGOT next Friday based on historical patterns.",
+        "Expected congestion at GDANSK on 2026-03-06?",
+        "Compare expected congestion next Friday between LVVNT and SEGOT.",
+        "Predict whether LUBECK is likely high congestion on 2026-02-20.",
+    ],
+    "Unsupported Scope": [
+        "What is crane utilization at berth 3 in SEGOT today?",
+        "What is gate queue length at Port of Gdansk right now?",
+    ],
+}
+
+PORT_ALIAS_TO_CODE: Dict[str, str] = {
+    "gothenburg": "SEGOT",
+    "goteborg": "SEGOT",
+    "goteborgs": "SEGOT",
+    "gdansk": "PLGDN",
+    "gdynia": "PLGDY",
+    "klaipeda": "LTKLJ",
+    "riga": "LVRIX",
+    "kotka": "FIKTK",
+    "swinoujscie": "PLSWI",
+    "szczecin": "PLSZZ",
+    "sodertalje": "SESOE",
+}
 
 
 @dataclass
@@ -220,6 +246,130 @@ def _pick_filter(override: Optional[str], extracted: Optional[str]) -> Optional[
     if extracted is not None and str(extracted).strip():
         return str(extracted).strip()
     return None
+
+
+def _normalize_text_token(value: str) -> str:
+    text = unicodedata.normalize("NFKD", value or "")
+    text = "".join(ch for ch in text if not unicodedata.combining(ch))
+    text = re.sub(r"\s+", " ", text).strip().lower()
+    text = re.sub(r"^port of\s+", "", text)
+    return text
+
+
+def _resolve_port_token(port_token: Optional[str], kpi: KPIQueryEngine) -> Optional[str]:
+    token = (port_token or "").strip()
+    if not token:
+        return None
+    if re.fullmatch(r"[A-Za-z]{2}\s?[A-Za-z]{3}", token):
+        return token.upper().replace(" ", "")
+    norm = _normalize_text_token(token)
+    alias_code = PORT_ALIAS_TO_CODE.get(norm)
+    if alias_code:
+        return alias_code
+
+    catalog = kpi.port_catalog
+    if catalog.empty:
+        return token
+
+    code = token.upper().replace(" ", "")
+
+    work = catalog.copy()
+    for col in ("port_key", "locode_norm", "port_label", "port_name_norm"):
+        if col not in work.columns:
+            work[col] = ""
+        work[col] = work[col].fillna("").astype(str)
+    if "arrivals_total" not in work.columns:
+        work["arrivals_total"] = 0
+    work["arrivals_total"] = pd.to_numeric(work["arrivals_total"], errors="coerce").fillna(0)
+    work["source_kind"] = work.get("source_kind", "").fillna("").astype(str).str.lower()
+    work["locode_norm"] = work.get("locode_norm", "").fillna("").astype(str).str.upper()
+    work["is_structured_port"] = (
+        (work["source_kind"] == "port_call")
+        & work["locode_norm"].str.fullmatch(r"[A-Z]{5}")
+    )
+
+    exact_code = work[
+        (work["port_key"].str.upper() == code) | (work["locode_norm"].str.upper() == code)
+    ]
+    if not exact_code.empty:
+        row = exact_code.sort_values("arrivals_total", ascending=False).iloc[0]
+        return str(row.get("port_key") or row.get("locode_norm") or token).strip()
+
+    work["port_label_norm"] = work["port_label"].map(_normalize_text_token)
+    work["port_name_norm_clean"] = work["port_name_norm"].map(_normalize_text_token)
+    contains = work[
+        work["port_label_norm"].str.contains(norm, regex=False)
+        | work["port_name_norm_clean"].str.contains(norm, regex=False)
+    ]
+    if not contains.empty:
+        if contains["is_structured_port"].any():
+            contains = contains[contains["is_structured_port"]]
+        row = contains.sort_values("arrivals_total", ascending=False).iloc[0]
+        return str(row.get("port_key") or row.get("locode_norm") or token).strip()
+
+    def _best_similarity(row: pd.Series) -> float:
+        cand_a = str(row.get("port_label_norm", ""))
+        cand_b = str(row.get("port_name_norm_clean", ""))
+        return max(
+            SequenceMatcher(None, norm, cand_a).ratio() if cand_a else 0.0,
+            SequenceMatcher(None, norm, cand_b).ratio() if cand_b else 0.0,
+        )
+
+    work["similarity"] = work.apply(_best_similarity, axis=1)
+    fuzzy = work[work["similarity"] >= 0.80]
+    if not fuzzy.empty:
+        if fuzzy["is_structured_port"].any():
+            fuzzy = fuzzy[fuzzy["is_structured_port"]]
+        row = fuzzy.sort_values(["similarity", "arrivals_total"], ascending=[False, False]).iloc[0]
+        return str(row.get("port_key") or row.get("locode_norm") or token).strip()
+
+    return token
+
+
+def _resolve_ports(port_tokens: List[str], kpi: KPIQueryEngine) -> List[str]:
+    resolved: List[str] = []
+    for token in port_tokens:
+        mapped = _resolve_port_token(token, kpi) or token
+        if mapped not in resolved:
+            resolved.append(mapped)
+    return resolved
+
+
+def _derive_answer_source(
+    result: Union[AnalyticsResult, ForecastResult],
+    evidence: EvidenceBundle,
+) -> tuple[str, str]:
+    data_source_note = next(
+        (n for n in result.coverage_notes if n.startswith("Data sources used:")),
+        "",
+    )
+    source_text = data_source_note.replace("Data sources used:", "").strip().lower()
+    retrieval_status = str((evidence.trace or {}).get("retrieval_status", "")).lower()
+    has_vector_rows = bool(evidence.rows)
+
+    if isinstance(result, ForecastResult):
+        label = "Computed from historical congestion proxy series"
+    elif "port_call" in source_text and "ais_destination_proxy" in source_text:
+        label = "Hybrid computed answer (port-call + AIS proxy)"
+    elif "port_call" in source_text:
+        label = "Computed from port-call records"
+    elif "ais_destination_proxy" in source_text:
+        label = "Computed from AIS-derived proxy logic"
+    elif retrieval_status in {"ok", "no_hits", "computed_only"} or has_vector_rows:
+        label = "Retrieved from evidence chunks"
+    else:
+        label = "Computed answer"
+
+    detail = (
+        "Numeric outputs come from deterministic KPI/forecast computation; "
+        "vector retrieval is used for supporting evidence and traceability."
+    )
+    if retrieval_status == "computed_only":
+        detail = (
+            "Primary evidence came from deterministic row-level computation; "
+            "vector retrieval had no matching rows for this query."
+        )
+    return label, detail
 
 
 def _make_rag_filters(
@@ -480,7 +630,8 @@ def _handle_ask_question(
     entities = intent_result.entities
     q_lower = question.lower()
 
-    port = _pick_filter(user_filters.get("port"), entities.get("port"))
+    raw_port = _pick_filter(user_filters.get("port"), entities.get("port"))
+    port = _resolve_port_token(raw_port, kpi)
     start = _pick_filter(user_filters.get("date_from"), entities.get("date_from"))
     end = _pick_filter(user_filters.get("date_to"), entities.get("date_to"))
     vessel_type = _pick_filter(user_filters.get("vessel_type"), entities.get("vessel_type"))
@@ -493,6 +644,20 @@ def _handle_ask_question(
     ports: List[str] = [str(p).strip() for p in entities.get("ports") or [] if str(p).strip()]
     if port and port not in ports:
         ports.insert(0, port)
+    ports = _resolve_ports(ports, kpi)
+
+    if start and end:
+        start_ts = pd.to_datetime(start, errors="coerce", utc=True)
+        end_ts = pd.to_datetime(end, errors="coerce", utc=True)
+        if pd.notna(start_ts) and pd.notna(end_ts) and start_ts > end_ts:
+            return (
+                KPIQueryEngine.no_data("Invalid date range: `From date` is after `To date`."),
+                EvidenceBundle(lines=[], rows=[], trace={}),
+            )
+
+    evidence_overrides = dict(user_filters)
+    if port:
+        evidence_overrides["port"] = port
 
     if intent_result.intent == "G":
         return (
@@ -515,7 +680,7 @@ def _handle_ask_question(
             retriever=retriever,
             question=question,
             entities=entities,
-            overrides=user_filters,
+            overrides=evidence_overrides,
             top_k=top_k_evidence,
             include_dates=True,
         )
@@ -540,7 +705,7 @@ def _handle_ask_question(
             retriever=retriever,
             question=question,
             entities=entities,
-            overrides=user_filters,
+            overrides=evidence_overrides,
             top_k=top_k_evidence,
             include_dates=True,
         )
@@ -559,7 +724,7 @@ def _handle_ask_question(
                 retriever=retriever,
                 question=question,
                 entities=entities,
-                overrides=user_filters,
+                overrides=evidence_overrides,
                 top_k=top_k_evidence,
                 include_dates=False,
             )
@@ -582,7 +747,7 @@ def _handle_ask_question(
             retriever=retriever,
             question=question,
             entities=entities,
-            overrides=user_filters,
+            overrides=evidence_overrides,
             top_k=top_k_evidence,
             include_dates=False,
         )
@@ -601,7 +766,7 @@ def _handle_ask_question(
             retriever=retriever,
             question=question,
             entities=entities,
-            overrides=user_filters,
+            overrides=evidence_overrides,
             top_k=top_k_evidence,
             include_dates=True,
         )
@@ -618,7 +783,7 @@ def _handle_ask_question(
             retriever=retriever,
             question=question,
             entities=entities,
-            overrides=user_filters,
+            overrides=evidence_overrides,
             top_k=top_k_evidence,
             include_dates=True,
         )
@@ -626,7 +791,7 @@ def _handle_ask_question(
 
     if intent_result.intent == "F":
         if any(token in q_lower for token in ("jump", "spoof", "teleport", "impossible")):
-            filters = _make_rag_filters(entities=entities, overrides=user_filters, include_dates=True)
+            filters = _make_rag_filters(entities=entities, overrides=evidence_overrides, include_dates=True)
             jump_result: Dict[str, Any]
             jump_source = ""
             if events_path and events_path.exists():
@@ -716,7 +881,7 @@ def _handle_ask_question(
             retriever=retriever,
             question=question,
             entities=entities,
-            overrides=user_filters,
+            overrides=evidence_overrides,
             top_k=top_k_evidence,
             include_dates=True,
         )
@@ -739,7 +904,7 @@ def _handle_ask_question(
         retriever=retriever,
         question=question,
         entities=entities,
-        overrides=user_filters,
+        overrides=evidence_overrides,
         top_k=top_k_evidence,
         include_dates=True,
     )
@@ -749,6 +914,7 @@ def _handle_ask_question(
 def _render_compact_result(
     result: Union[AnalyticsResult, ForecastResult],
     evidence: EvidenceBundle,
+    show_technical: bool,
 ) -> None:
     def _fallback_evidence_from_result(
         value: Union[AnalyticsResult, ForecastResult],
@@ -820,6 +986,55 @@ def _render_compact_result(
         if isinstance(value, ForecastResult):
             return "medium (forecast based on available historical patterns)"
         return "medium (deterministic aggregation over filtered rows)"
+
+    def _to_analyst_evidence_line(line: str) -> str:
+        if "|" not in line:
+            return line
+        return line.split("|", maxsplit=3)[-1].strip()
+
+    def _build_recommendation_triggers(value: Union[AnalyticsResult, ForecastResult]) -> List[str]:
+        triggers: List[str] = []
+        if isinstance(value, ForecastResult) and value.forecast is not None and not value.forecast.empty:
+            pred = float(value.forecast["predicted"].mean())
+            upper = float(value.forecast["upper"].mean()) if "upper" in value.forecast.columns else pred
+            lower = float(value.forecast["lower"].mean()) if "lower" in value.forecast.columns else pred
+            if pred >= 1.8:
+                triggers.append("Trigger: forecast congestion index >= 1.80 (high-pressure band).")
+            elif pred >= 1.3:
+                triggers.append("Trigger: forecast congestion index in 1.30-1.79 (elevated band).")
+            else:
+                triggers.append("Trigger: forecast congestion index < 1.30 (normal-to-low band).")
+            triggers.append(f"Trigger: uncertainty interval {lower:.2f}-{upper:.2f} used to size staffing buffer.")
+            return triggers
+
+        answer_text = value.answer.lower()
+        if "jump" in answer_text or "anomaly" in answer_text:
+            if value.table is not None and not value.table.empty:
+                max_dist = (
+                    float(pd.to_numeric(value.table.get("distance_km"), errors="coerce").max())
+                    if "distance_km" in value.table.columns
+                    else None
+                )
+                triggers.append("Trigger: anomaly heuristic matched at least one AIS jump event.")
+                if max_dist is not None and not pd.isna(max_dist):
+                    triggers.append(f"Trigger: max detected displacement {max_dist:.2f} km in a short interval.")
+            else:
+                triggers.append("Trigger: anomaly heuristic did not find qualifying jump events.")
+            return triggers
+
+        if value.chart is not None and not value.chart.empty:
+            first_col = [c for c in value.chart.columns if c != "date"]
+            if first_col:
+                metric_col = first_col[0]
+                metric_values = pd.to_numeric(value.chart[metric_col], errors="coerce").dropna()
+                if not metric_values.empty:
+                    triggers.append(
+                        f"Trigger: planning recommendation based on observed {metric_col} range "
+                        f"{metric_values.min():.2f}-{metric_values.max():.2f}."
+                    )
+        if not triggers:
+            triggers.append("Trigger: recommendation generated from filtered KPI summary for the selected window.")
+        return triggers
 
     def _build_method_steps(value: Union[AnalyticsResult, ForecastResult]) -> List[str]:
         steps: List[str] = []
@@ -1080,6 +1295,11 @@ def _render_compact_result(
     if evidence_backed:
         st.info(evidence_backed)
 
+    source_label, source_detail = _derive_answer_source(result, evidence)
+    st.subheader("Answer Source")
+    st.write(source_label)
+    st.caption(source_detail)
+
     if isinstance(result, ForecastResult):
         meaning_note = next((n for n in result.coverage_notes if n.startswith("Meaning:")), None)
         if meaning_note:
@@ -1089,20 +1309,22 @@ def _render_compact_result(
     st.subheader("Evidence")
     retrieved_lines = evidence.lines
     computed_lines = _fallback_evidence_from_result(result)
+    display_lines = retrieved_lines if show_technical else [_to_analyst_evidence_line(line) for line in retrieved_lines]
 
     if computed_lines:
         st.markdown("**Computed evidence used for this answer**")
         for line in computed_lines:
             st.markdown(f"- {line}")
-    if retrieved_lines:
+    if display_lines:
         st.markdown("**Retrieved supporting evidence**")
-        for line in retrieved_lines:
+        for line in display_lines:
             st.markdown(f"- {line}")
-    if not retrieved_lines and not computed_lines:
+    if not display_lines and not computed_lines:
         st.info("No evidence rows were available for this response.")
 
     st.subheader("Confidence")
     st.write(_extract_confidence_label(result))
+    st.caption("Confidence reflects evidence strength and filter consistency, not ground-truth certainty.")
 
     _render_chart(result)
 
@@ -1115,6 +1337,9 @@ def _render_compact_result(
     st.subheader("Port Operations Recommendations")
     for action in _build_port_actions(result):
         st.markdown(f"- {action}")
+    st.markdown("**Recommendation Triggers**")
+    for trigger in _build_recommendation_triggers(result):
+        st.markdown(f"- {trigger}")
 
     st.subheader("Retrieval Provenance")
     trace = evidence.trace or {}
@@ -1133,14 +1358,17 @@ def _render_compact_result(
         where_used = trace.get("where_filter")
         if where_used not in (None, "", {}):
             st.write(f"Where filter: `{where_used}`")
-    if evidence.rows:
-        trace_df = pd.DataFrame(evidence.rows)
-        cols = [c for c in ["vector_id", "chunk_id", "distance", "timestamp", "port", "vessel_type", "mmsi"] if c in trace_df.columns]
-        st.dataframe(trace_df[cols], use_container_width=True, hide_index=True)
+    if show_technical:
+        if evidence.rows:
+            trace_df = pd.DataFrame(evidence.rows)
+            cols = [c for c in ["vector_id", "chunk_id", "distance", "timestamp", "port", "vessel_type", "mmsi"] if c in trace_df.columns]
+            st.dataframe(trace_df[cols], width="stretch", hide_index=True)
+        else:
+            st.info("No vector rows available for this query. Evidence above may come from deterministic KPI computation.")
+        with st.expander("Raw retrieval trace JSON", expanded=False):
+            st.json(trace)
     else:
-        st.info("No vector rows available for this query. Evidence above may come from deterministic KPI computation.")
-    with st.expander("Raw retrieval trace JSON", expanded=False):
-        st.json(trace)
+        st.caption("Enable `Technical audit mode` from the sidebar to view vector IDs, chunk IDs, and raw trace JSON.")
 
 
 def main() -> None:
@@ -1177,6 +1405,11 @@ def main() -> None:
     with st.sidebar:
         st.subheader("Ask Settings")
         top_k_evidence = st.slider("Evidence top K", min_value=1, max_value=8, value=5)
+        show_technical = st.toggle(
+            "Technical audit mode",
+            value=False,
+            help="Show vector IDs, chunk IDs, and raw retrieval trace JSON.",
+        )
         st.caption("Keep questions specific (port + date helps).")
         if using_demo_processed:
             st.info("Running with bundled demo processed data (`demo_data/processed`).")
@@ -1262,17 +1495,22 @@ def main() -> None:
 
     st.subheader("Sample Queries")
     if "ask_question" not in st.session_state:
-        st.session_state["ask_question"] = SAMPLE_QUERIES[0]
+        st.session_state["ask_question"] = SAMPLE_QUERIES_BY_CATEGORY["Traffic Monitoring"][0]
 
-    selected = st.selectbox("Try a sample query", options=SAMPLE_QUERIES, index=0)
+    categories = list(SAMPLE_QUERIES_BY_CATEGORY.keys())
+    sample_category = st.selectbox("Query category", options=categories, index=0)
+    selected = st.selectbox("Try a sample query", options=SAMPLE_QUERIES_BY_CATEGORY[sample_category], index=0)
     if st.button("Load sample query"):
         st.session_state["ask_question"] = selected
 
     st.subheader("Ask")
     st.text_area("Question", key="ask_question", height=90)
+    st.caption(
+        "Scope note: congestion is a port-level proxy from AIS/port-call history, not berth-level ground truth."
+    )
 
     with st.expander("Optional filters", expanded=False):
-        ui_port = st.text_input("Port / LOCODE", value="")
+        ui_port = st.text_input("Port / LOCODE / name", value="", help="Examples: SEGOT, Gothenburg, Port of Gothenburg")
         ui_date_from = st.text_input("From date (YYYY-MM-DD)", value="")
         ui_date_to = st.text_input("To date (YYYY-MM-DD)", value="")
         ui_vessel_type = st.text_input("Vessel type", value="")
@@ -1308,7 +1546,7 @@ def main() -> None:
         events_path=events_path if events_path.exists() else None,
     )
 
-    _render_compact_result(result=result, evidence=evidence)
+    _render_compact_result(result=result, evidence=evidence, show_technical=show_technical)
 
 
 if __name__ == "__main__":
