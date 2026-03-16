@@ -19,6 +19,7 @@ DOW_NAMES = [
     "sunday",
 ]
 DOW_TITLE = {name: name.title() for name in DOW_NAMES}
+SPECIAL_DOW_NAMES = {"weekend": "Weekend", "weekday": "Weekday"}
 
 UNSUPPORTED_KEYWORDS = (
     "crane",
@@ -198,6 +199,14 @@ def _extract_days_of_week(question: str) -> List[str]:
     return [name for _, name in hits]
 
 
+def _extract_special_dow(question: str) -> Optional[str]:
+    q = question.lower()
+    for token, label in SPECIAL_DOW_NAMES.items():
+        if token in q:
+            return label
+    return None
+
+
 def _extract_metric(question: str) -> str:
     q = question.lower()
     if "dwell" in q:
@@ -211,6 +220,15 @@ def _extract_metric(question: str) -> str:
     if "spike" in q or "anomaly" in q:
         return "arrivals_spike"
     return "arrivals_vessels"
+
+
+def _extract_aggregation(question: str) -> Optional[str]:
+    q = question.lower()
+    if any(token in q for token in ("highest", "maximum", "max", "peak")) and any(
+        token in q for token in ("day", "date")
+    ):
+        return "peak_day"
+    return None
 
 
 def _extract_vessel_type(question: str) -> Optional[str]:
@@ -402,6 +420,7 @@ def classify_question(question: str) -> IntentResult:
         start_date = target_date
         end_date = target_date
     dows = _extract_days_of_week(question)
+    special_dow = _extract_special_dow(question)
     entities: Dict[str, Any] = {
         "ports": _extract_ports(question),
         "port": None,
@@ -410,9 +429,10 @@ def classify_question(question: str) -> IntentResult:
         "target_date": target_date,
         "window": window,
         "vessel_type": _extract_vessel_type(question),
-        "dow": dows[0] if dows else None,
+        "dow": dows[0] if dows else special_dow,
         "dow_compare": dows[1] if len(dows) > 1 else None,
         "metric": _extract_metric(question),
+        "aggregation": _extract_aggregation(question),
         "horizon_weeks": _extract_horizon_weeks(question),
         "mmsi": None,
         "imo": None,

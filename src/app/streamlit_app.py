@@ -37,7 +37,7 @@ SAMPLE_QUERIES_BY_CATEGORY: Dict[str, List[str]] = {
         "Compare Friday and Monday arrivals at GDANSK in March 2022.",
     ],
     "Vessel Investigation": [
-        "For MMSI 266232000, summarize movement and destination changes on 2021-01-01.",
+        "For MMSI 266232000, how long was the vessel in port on 2021-03-01?",
         "Show suspicious AIS jumps for MMSI 246521000 on 2022-03-10.",
     ],
     "Forecast Planning": [
@@ -666,6 +666,8 @@ def _handle_ask_question(
     target_date = entities.get("target_date")
     window = entities.get("window")
     metric = entities.get("metric", "arrivals_vessels")
+    aggregation = entities.get("aggregation")
+    mmsi = entities.get("mmsi")
     horizon_weeks = int(entities.get("horizon_weeks") or 4)
 
     ports: List[str] = [str(p).strip() for p in entities.get("ports") or [] if str(p).strip()]
@@ -709,7 +711,17 @@ def _handle_ask_question(
         return result, evidence
 
     if intent_result.intent == "A":
-        if "top" in q_lower and "port" in q_lower:
+        if aggregation == "peak_day":
+            result = kpi.get_peak_arrival_day(
+                port=port,
+                start=start,
+                end=end,
+                vessel_type=vessel_type,
+                window=window,
+            )
+        elif mmsi and any(token in q_lower for token in ("how long", "dwell", "in port", "port stay", "stayed")):
+            result = kpi.get_mmsi_port_stays(mmsi=str(mmsi), start=start, end=end, port=port)
+        elif "top" in q_lower and "port" in q_lower:
             result = kpi.top_ports_by_arrivals(start=start, end=end, vessel_type=vessel_type, dow=dow)
         elif "dwell" in q_lower:
             result = kpi.get_avg_dwell_time(port=port, start=start, end=end, vessel_type=vessel_type, dow=dow)
@@ -728,7 +740,15 @@ def _handle_ask_question(
         return result, evidence
 
     if intent_result.intent == "B":
-        if entities.get("dow") and entities.get("dow_compare"):
+        if aggregation == "peak_day":
+            result = kpi.get_peak_arrival_day(
+                port=port,
+                start=start,
+                end=end,
+                vessel_type=vessel_type,
+                window=window,
+            )
+        elif entities.get("dow") and entities.get("dow_compare"):
             result = kpi.compare_weekdays(
                 port=port,
                 start=start,
@@ -1663,12 +1683,22 @@ def main() -> None:
     if not events_path.exists():
         events_path = default_processed_dir / "events.parquet"
 
+    default_from_date = pd.Timestamp.now().floor("D") - pd.Timedelta(days=30)
+    default_to_date = pd.Timestamp.now().floor("D")
+    if not kpi_engine.arrivals_daily.empty and "date" in kpi_engine.arrivals_daily.columns:
+        date_series = pd.to_datetime(kpi_engine.arrivals_daily["date"], errors="coerce", utc=True).dropna()
+        if not date_series.empty:
+            default_from_date = date_series.min().floor("D")
+            default_to_date = date_series.max().floor("D")
+
     st.subheader("Sample Queries")
     if "ask_question" not in st.session_state:
         st.session_state["ask_question"] = SAMPLE_QUERIES_BY_CATEGORY["Traffic Monitoring"][0]
 
     categories = list(SAMPLE_QUERIES_BY_CATEGORY.keys())
     sample_category = st.selectbox("Query category", options=categories, index=0)
+    if sample_category == "Carbon & Emissions":
+        st.caption("Carbon layer query tip: include boundary keywords (`TTW`/`WTW`) and pollutants (`CO2`, `NOx`, `SOx`, `PM`).")
     selected = st.selectbox("Try a sample query", options=SAMPLE_QUERIES_BY_CATEGORY[sample_category], index=0)
     if st.button("Load sample query"):
         st.session_state["ask_question"] = selected
@@ -1681,8 +1711,28 @@ def main() -> None:
 
     with st.expander("Optional filters", expanded=False):
         ui_port = st.text_input("Port / LOCODE / name", value="", help="Examples: SEGOT, Gothenburg, Port of Gothenburg")
-        ui_date_from = st.text_input("From date (YYYY-MM-DD)", value="")
-        ui_date_to = st.text_input("To date (YYYY-MM-DD)", value="")
+        use_date_range = st.checkbox(
+            "Apply date range filter",
+            value=False,
+            help="Use calendar inputs to avoid date formatting errors.",
+        )
+        if use_date_range:
+            date_col_1, date_col_2 = st.columns(2)
+            ui_date_from_obj = date_col_1.date_input(
+                "From date",
+                value=default_from_date.date(),
+                format="YYYY-MM-DD",
+            )
+            ui_date_to_obj = date_col_2.date_input(
+                "To date",
+                value=default_to_date.date(),
+                format="YYYY-MM-DD",
+            )
+            ui_date_from = pd.Timestamp(ui_date_from_obj).strftime("%Y-%m-%d")
+            ui_date_to = pd.Timestamp(ui_date_to_obj).strftime("%Y-%m-%d")
+        else:
+            ui_date_from = ""
+            ui_date_to = ""
         ui_vessel_type = st.text_input("Vessel type", value="")
         ui_anomaly = st.selectbox("Anomaly flag", options=["any", "true", "false"], index=0)
 

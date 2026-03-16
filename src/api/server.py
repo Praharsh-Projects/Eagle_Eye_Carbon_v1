@@ -463,6 +463,8 @@ def _handle_ask_question_api(
     target_date = entities.get("target_date")
     window = entities.get("window")
     metric = entities.get("metric", "arrivals_vessels")
+    aggregation = entities.get("aggregation")
+    mmsi = entities.get("mmsi")
     horizon_weeks = int(entities.get("horizon_weeks") or 4)
     ports: List[str] = [str(p).strip() for p in entities.get("ports") or [] if str(p).strip()]
     if port and port not in ports:
@@ -489,7 +491,17 @@ def _handle_ask_question_api(
         return result, evidence
 
     if intent_result.intent == "A":
-        if "top" in q_lower and "port" in q_lower:
+        if aggregation == "peak_day":
+            result = kpi.get_peak_arrival_day(
+                port=port,
+                start=start,
+                end=end,
+                vessel_type=vessel_type,
+                window=window,
+            )
+        elif mmsi and any(token in q_lower for token in ("how long", "dwell", "in port", "port stay", "stayed")):
+            result = kpi.get_mmsi_port_stays(mmsi=str(mmsi), start=start, end=end, port=port)
+        elif "top" in q_lower and "port" in q_lower:
             result = kpi.top_ports_by_arrivals(start=start, end=end, vessel_type=vessel_type, dow=dow)
         elif "dwell" in q_lower:
             result = kpi.get_avg_dwell_time(port=port, start=start, end=end, vessel_type=vessel_type, dow=dow)
@@ -501,7 +513,15 @@ def _handle_ask_question_api(
         return result, evidence
 
     if intent_result.intent == "B":
-        if entities.get("dow") and entities.get("dow_compare"):
+        if aggregation == "peak_day":
+            result = kpi.get_peak_arrival_day(
+                port=port,
+                start=start,
+                end=end,
+                vessel_type=vessel_type,
+                window=window,
+            )
+        elif entities.get("dow") and entities.get("dow_compare"):
             result = kpi.compare_weekdays(
                 port=port,
                 start=start,

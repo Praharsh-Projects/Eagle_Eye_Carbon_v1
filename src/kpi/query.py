@@ -24,6 +24,13 @@ def _normalize_port_token(value: Optional[str]) -> Optional[str]:
     return value.strip()
 
 
+def _normalize_mmsi(value: Optional[str]) -> Optional[str]:
+    if not value:
+        return None
+    digits = re.sub(r"\D", "", str(value))
+    return digits or None
+
+
 def _as_date_str(value: pd.Timestamp) -> str:
     return value.strftime("%Y-%m-%d")
 
@@ -217,7 +224,12 @@ class KPIQueryEngine:
         norm = dow.strip().title()
         work = df.copy()
         dates = pd.to_datetime(work[date_col], errors="coerce", utc=True)
-        work = work[dates.dt.day_name() == norm]
+        if norm == "Weekend":
+            work = work[dates.dt.day_name().isin(["Saturday", "Sunday"])]
+        elif norm == "Weekday":
+            work = work[~dates.dt.day_name().isin(["Saturday", "Sunday"])]
+        else:
+            work = work[dates.dt.day_name() == norm]
         return work
 
     @staticmethod
@@ -284,6 +296,49 @@ class KPIQueryEngine:
             caveats=[
                 "Arrivals are based on port-call events when available; AIS destination proxy is used otherwise.",
             ],
+        )
+
+    def get_peak_arrival_day(
+        self,
+        port: Optional[str],
+        start: Optional[str],
+        end: Optional[str],
+        vessel_type: Optional[str] = None,
+        window: Optional[str] = None,
+    ) -> AnalyticsResult:
+        base = self.get_arrivals(
+            port=port,
+            start=start,
+            end=end,
+            vessel_type=vessel_type,
+            dow=None,
+            window=window,
+        )
+        if base.status != "ok" or base.table is None or base.table.empty:
+            return base
+
+        daily = base.table.copy()
+        daily["date"] = pd.to_datetime(daily["date"], errors="coerce", utc=True).dt.floor("D")
+        daily = daily.dropna(subset=["date"]).sort_values("date")
+        if daily.empty:
+            return self.no_data("No daily rows were available to compute a peak day.")
+
+        peak = daily.loc[daily["arrivals_vessels"].idxmax()]
+        peak_date = peak["date"].strftime("%Y-%m-%d")
+        peak_val = int(peak["arrivals_vessels"])
+
+        answer = (
+            f"Peak arrivals day is {peak_date} with {peak_val:,} vessel arrivals"
+            + (f" for {port}" if port else "")
+            + "."
+        )
+        return AnalyticsResult(
+            status="ok",
+            answer=answer,
+            table=daily,
+            chart=daily.set_index("date")[["arrivals_vessels"]],
+            coverage_notes=base.coverage_notes + [f"Peak day computed from {len(daily):,} day buckets."],
+            caveats=base.caveats,
         )
 
     def top_ports_by_arrivals(
@@ -496,6 +551,78 @@ class KPIQueryEngine:
             chart=None,
             coverage_notes=self.coverage_notes(work, "arrival_date"),
             caveats=[],
+        )
+
+    def get_mmsi_port_stays(
+        self,
+        mmsi: str,
+        start: Optional[str],
+        end: Optional[str],
+        port: Optional[str] = None,
+    ) -> AnalyticsResult:
+        if self.dwell.empty:
+            return self.no_data("dwell_time.parquet is missing.")
+
+        norm_mmsi = _normalize_mmsi(mmsi)
+        if not norm_mmsi:
+            return self.no_data("Invalid MMSI provided.")
+
+        work = self._filter_port(self.dwell, port)
+        work = self._filter_dates(work, "arrival_date", start, end)
+        if "mmsi" in work.columns:
+            mmsi_series = work["mmsi"].astype(str).map(_normalize_mmsi)
+            work = work[mmsi_series == norm_mmsi]
+
+        if work.empty:
+            return self.no_data("No port-stay rows matched this MMSI and date range.")
+
+        cols = [
+            c
+            for c in [
+                "mmsi",
+                "port_key",
+                "port_label",
+                "arrival_time",
+                "departure_time",
+                "dwell_minutes",
+                "vessel_type_norm",
+                "source_kind",
+            ]
+            if c in work.columns
+        ]
+        table = (
+            work[cols]
+            .copy()
+            .sort_values("arrival_time" if "arrival_time" in cols else cols[0])
+            .reset_index(drop=True)
+        )
+        total_calls = len(table)
+        total_hours = float(pd.to_numeric(table["dwell_minutes"], errors="coerce").fillna(0).sum() / 60.0)
+        median_minutes = float(pd.to_numeric(table["dwell_minutes"], errors="coerce").median())
+
+        answer = (
+            f"MMSI {norm_mmsi} had {total_calls:,} matched port call(s), "
+            f"median dwell {median_minutes:.1f} minutes, total dwell {total_hours:.1f} hours."
+        )
+        if port:
+            answer = answer[:-1] + f" for {port}."
+
+        chart = None
+        if {"arrival_time", "dwell_minutes"}.issubset(table.columns):
+            chart = (
+                table.assign(arrival_time=pd.to_datetime(table["arrival_time"], errors="coerce", utc=True))
+                .dropna(subset=["arrival_time"])
+                .sort_values("arrival_time")
+                .set_index("arrival_time")[["dwell_minutes"]]
+            )
+
+        return AnalyticsResult(
+            status="ok",
+            answer=answer,
+            table=table,
+            chart=chart,
+            coverage_notes=self.coverage_notes(work, "arrival_date"),
+            caveats=["Duration reflects arrival-to-departure time from port-call records."],
         )
 
     def get_congestion(
