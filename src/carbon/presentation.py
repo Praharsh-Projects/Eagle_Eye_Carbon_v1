@@ -70,6 +70,23 @@ def format_percent(value: float, decimals: int = 1) -> str:
     return f"{float(value):,.{decimals}f}%"
 
 
+def safe_percent_delta(
+    current_value: Optional[float],
+    baseline_value: Optional[float],
+    min_denominator: float = 1.0,
+) -> Optional[float]:
+    if current_value is None or baseline_value is None:
+        return None
+    try:
+        curr = float(current_value)
+        base = float(baseline_value)
+    except Exception:
+        return None
+    if abs(base) < float(min_denominator):
+        return None
+    return ((curr - base) / base) * 100.0
+
+
 def format_hours(value_hours: float, decimals: int = 1) -> str:
     return f"{float(value_hours):,.{decimals}f} h"
 

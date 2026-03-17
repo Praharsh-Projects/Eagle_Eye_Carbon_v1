@@ -6,9 +6,11 @@ from src.carbon.presentation import (
     build_emissions_findings,
     build_reduction_suggestions,
     classify_level,
+    compute_emissions_metrics,
     derive_threshold_bands,
     extract_chart_findings,
     format_tco2e,
+    safe_percent_delta,
     sanitize_threshold_percentiles,
     scale_tco2e,
 )
@@ -73,6 +75,28 @@ class CarbonPresentationTests(unittest.TestCase):
             sanitize_threshold_percentiles([0.5, 0.2, 0.8]),
             (0.25, 0.50, 0.75),
         )
+
+    def test_safe_percent_delta_guardrail(self) -> None:
+        self.assertIsNone(safe_percent_delta(current_value=10.0, baseline_value=0.2, min_denominator=1.0))
+        self.assertAlmostEqual(
+            safe_percent_delta(current_value=12.0, baseline_value=10.0, min_denominator=1.0),
+            20.0,
+            places=6,
+        )
+
+    def test_intensity_uses_unique_vessel_calls(self) -> None:
+        df = pd.DataFrame(
+            {
+                "call_id": ["A", "A", "B"],
+                "ttw_co2e_t": [1.0, 2.0, 3.0],
+                "date": ["2022-01-01", "2022-01-01", "2022-01-02"],
+                "duration_h": [1.0, 1.0, 2.0],
+            }
+        )
+        metrics = compute_emissions_metrics(df, boundary="TTW")
+        self.assertAlmostEqual(float(metrics["total_tco2e"]), 6.0, places=6)
+        # 6 tCO2e == 6000 kgCO2e over 2 unique calls => 3000 kgCO2e/call
+        self.assertAlmostEqual(float(metrics["intensity_kg_per_call"]), 3000.0, places=6)
 
 
 if __name__ == "__main__":

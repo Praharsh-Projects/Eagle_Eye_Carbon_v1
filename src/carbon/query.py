@@ -4,9 +4,9 @@ from __future__ import annotations
 
 import json
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence
+from typing import Any, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import pandas as pd
@@ -16,6 +16,13 @@ from src.carbon.factors import load_factor_registry
 
 
 SUPPORTED_POLLUTANTS = ["CO2", "CO2e", "NOx", "SOx", "PM"]
+
+CARBON_STATE_COMPUTED = "COMPUTED"
+CARBON_STATE_COMPUTED_ZERO = "COMPUTED_ZERO"
+CARBON_STATE_NOT_COMPUTABLE = "NOT_COMPUTABLE"
+CARBON_STATE_RETRIEVAL_ONLY = "RETRIEVAL_ONLY"
+CARBON_STATE_FORECAST_ONLY = "FORECAST_ONLY"
+CARBON_STATE_UNSUPPORTED = "UNSUPPORTED"
 
 
 def _norm_boundary(value: str) -> str:
@@ -81,6 +88,21 @@ def _date_filter(df: pd.DataFrame, date_col: str, date_from: Optional[str], date
     return work
 
 
+def _sum_col(df: pd.DataFrame, col: str) -> float:
+    if col not in df.columns:
+        return 0.0
+    return float(pd.to_numeric(df[col], errors="coerce").fillna(0.0).sum())
+
+
+def _mean_col(df: pd.DataFrame, col: str) -> float:
+    if col not in df.columns:
+        return 0.0
+    s = pd.to_numeric(df[col], errors="coerce").dropna()
+    if s.empty:
+        return 0.0
+    return float(s.mean())
+
+
 @dataclass
 class CarbonResult:
     status: str
@@ -98,6 +120,8 @@ class CarbonResult:
     params_version: str
     evidence_ids: List[str]
     segment_ids: List[str]
+    result_state: str = CARBON_STATE_NOT_COMPUTABLE
+    diagnostics: Dict[str, Any] = field(default_factory=dict)
     export_csv_path: Optional[str] = None
     export_json_path: Optional[str] = None
 
@@ -108,6 +132,7 @@ class CarbonQueryEngine:
         processed_dir: str | Path = "data/processed",
         factor_registry_path: str | Path = "config/carbon_factors.v1.json",
         monte_carlo_draws: int = 500,
+        sanity_config: Optional[Dict[str, Any]] = None,
         auto_build: bool = True,
     ) -> None:
         self.processed_dir = Path(processed_dir)
@@ -118,6 +143,18 @@ class CarbonQueryEngine:
         self._segments: Optional[pd.DataFrame] = None
         self._evidence: Optional[pd.DataFrame] = None
         self._params: Optional[Dict[str, Any]] = None
+        self.sanity_config = {
+            "max_call_duration_h": 240.0,
+            "max_call_tco2e": 500.0,
+            "min_baseline_denominator_tco2e": 1.0,
+        }
+        if sanity_config:
+            for key in list(self.sanity_config.keys()):
+                if key in sanity_config:
+                    try:
+                        self.sanity_config[key] = float(sanity_config[key])
+                    except Exception:
+                        pass
         self.export_dir = self.processed_dir / "carbon_exports"
         self._runtime_export_fallback_dir = Path("/tmp/eagle_eye_carbon_exports")
         try:
@@ -198,23 +235,42 @@ class CarbonQueryEngine:
             self._evidence = pd.read_parquet(path) if path.exists() else pd.DataFrame()
         return self._evidence
 
-    def _no_data(self, message: str, boundary: str = "TTW", pollutants: Optional[List[str]] = None) -> CarbonResult:
+    def _no_data(
+        self,
+        message: str,
+        boundary: str = "TTW",
+        pollutants: Optional[List[str]] = None,
+        result_state: str = CARBON_STATE_NOT_COMPUTABLE,
+        diagnostics: Optional[Dict[str, Any]] = None,
+    ) -> CarbonResult:
+        caveats: List[str] = []
+        if result_state in {CARBON_STATE_NOT_COMPUTABLE, CARBON_STATE_RETRIEVAL_ONLY}:
+            caveats.append("Run `python -m src.carbon.build --processed_dir data/processed` to materialize carbon outputs.")
+        if result_state == CARBON_STATE_FORECAST_ONLY:
+            caveats.append("Carbon forecast mode is not implemented in this runtime; only deterministic inventory queries are supported.")
+        if result_state == CARBON_STATE_UNSUPPORTED:
+            caveats.append("This carbon request is outside the supported deterministic scope for current data artifacts.")
+        if not caveats:
+            caveats.append("Deterministic carbon output is unavailable for this scope.")
+
         return CarbonResult(
             status="no_data",
-            answer="I don't have evidence in the dataset to answer that carbon query.",
+            answer=message,
             table=None,
             chart=None,
             coverage_notes=[message],
-            caveats=["Run `python -m src.carbon.build --processed_dir data/processed` to materialize carbon outputs."],
+            caveats=caveats,
             boundary=boundary,
             pollutants=pollutants or ["CO2e"],
-            source_label="Computed with fallback defaults",
+            source_label="Not computable from available carbon data",
             confidence_label="low",
-            confidence_reason="Missing carbon artifacts for deterministic computation.",
+            confidence_reason="Deterministic carbon computation unavailable for this scope.",
             uncertainty_interval={},
             params_version=str(self.params_version.get("version", "unknown")),
             evidence_ids=[],
             segment_ids=[],
+            result_state=result_state,
+            diagnostics=diagnostics or {},
         )
 
     def _build_uncertainty_summary(
@@ -233,6 +289,236 @@ class CarbonQueryEngine:
             upper = float(pd.to_numeric(df.get(upper_col, 0), errors="coerce").fillna(0).sum())
             summary[pol] = {"point": point, "lower": lower, "upper": upper}
         return summary
+
+    def _filtered_segments_scope(
+        self,
+        port_id: Optional[str],
+        date_from: Optional[str],
+        date_to: Optional[str],
+    ) -> pd.DataFrame:
+        seg = self.segments.copy()
+        if seg.empty:
+            return seg
+        if "timestamp_start" in seg.columns:
+            seg["timestamp_start"] = pd.to_datetime(seg["timestamp_start"], errors="coerce", utc=True)
+        seg = _port_filter(seg, port_id)
+        if "timestamp_start" in seg.columns:
+            seg = _date_filter(seg, "timestamp_start", date_from, date_to)
+        return seg
+
+    def _build_scope_diagnostics(
+        self,
+        seg_scope: pd.DataFrame,
+        metric_col: str,
+        baseline_values: Optional[Sequence[float]] = None,
+    ) -> Dict[str, Any]:
+        if seg_scope is None or seg_scope.empty:
+            return {
+                "unique_vessel_calls": 0,
+                "raw_rows_before_dedup": 0,
+                "rows_after_dedup": 0,
+                "duplicates_removed_rows": 0,
+                "total_duration_hours": 0.0,
+                "median_duration_hours": 0.0,
+                "total_tco2e": 0.0,
+                "mean_tco2e_per_call": None,
+                "median_tco2e_per_call": None,
+                "duplicated_call_ids_detected": 0,
+                "warnings": ["No deterministic carbon segments matched."],
+                "sanity_status": "unstable baseline",
+                "min_baseline_denominator_tco2e": float(self.sanity_config["min_baseline_denominator_tco2e"]),
+            }
+
+        work = seg_scope.copy()
+        call_work = work[work["call_id"].notna() & (work["call_id"].astype(str) != "")]
+        calls = (
+            call_work.groupby("call_id", dropna=False)[[metric_col, "duration_h"]]
+            .sum(numeric_only=True)
+            .reset_index()
+            if not call_work.empty
+            else pd.DataFrame(columns=["call_id", metric_col, "duration_h"])
+        )
+        unique_calls = int(calls["call_id"].nunique()) if not calls.empty else 0
+        raw_rows = int(pd.to_numeric(work.get("raw_row_count"), errors="coerce").fillna(1.0).sum()) if "raw_row_count" in work.columns else int(len(work))
+        dedup_rows = int(pd.to_numeric(work.get("row_count"), errors="coerce").fillna(1.0).sum()) if "row_count" in work.columns else int(len(work))
+        total_duration_h = float(pd.to_numeric(work.get("duration_h"), errors="coerce").fillna(0.0).sum())
+        call_durations = pd.to_numeric(calls.get("duration_h"), errors="coerce").dropna() if not calls.empty else pd.Series(dtype=float)
+        total_t = float(pd.to_numeric(work.get(metric_col), errors="coerce").fillna(0.0).sum())
+        call_vals = pd.to_numeric(calls.get(metric_col), errors="coerce").dropna() if not calls.empty else pd.Series(dtype=float)
+        mean_call_t = float(call_vals.mean()) if not call_vals.empty else None
+        med_call_t = float(call_vals.median()) if not call_vals.empty else None
+
+        duplicated_call_ids = int(calls["call_id"].duplicated().sum()) if not calls.empty else 0
+        warnings: List[str] = []
+        if not call_durations.empty and float(call_durations.max()) > float(self.sanity_config["max_call_duration_h"]):
+            warnings.append(
+                f"Implausible call duration detected (> {self.sanity_config['max_call_duration_h']:.0f} h)."
+            )
+        if not call_vals.empty and float(call_vals.max()) > float(self.sanity_config["max_call_tco2e"]):
+            warnings.append(
+                f"Per-call emissions exceed threshold (> {self.sanity_config['max_call_tco2e']:.1f} tCO2e)."
+            )
+        if duplicated_call_ids > 0:
+            warnings.append("Duplicated call IDs detected in aggregated call scope.")
+        if baseline_values is not None:
+            base_series = pd.to_numeric(pd.Series(list(baseline_values), dtype="float64"), errors="coerce").dropna()
+            if base_series.empty or float(base_series.median()) < float(self.sanity_config["min_baseline_denominator_tco2e"]):
+                warnings.append("Baseline denominator is too small for meaningful percentage comparison.")
+
+        sanity = "checked"
+        if warnings:
+            sanity = "warning"
+        if any("Baseline denominator" in w for w in warnings):
+            sanity = "unstable baseline"
+        if any("Duplicated call IDs" in w for w in warnings):
+            sanity = "possible duplication"
+
+        return {
+            "unique_vessel_calls": unique_calls,
+            "raw_rows_before_dedup": raw_rows,
+            "rows_after_dedup": dedup_rows,
+            "duplicates_removed_rows": max(0, raw_rows - dedup_rows),
+            "total_duration_hours": round(total_duration_h, 3),
+            "median_duration_hours": round(float(call_durations.median()), 3) if not call_durations.empty else 0.0,
+            "total_tco2e": total_t,
+            "mean_tco2e_per_call": mean_call_t,
+            "median_tco2e_per_call": med_call_t,
+            "duplicated_call_ids_detected": duplicated_call_ids,
+            "warnings": warnings,
+            "sanity_status": sanity,
+            "min_baseline_denominator_tco2e": float(self.sanity_config["min_baseline_denominator_tco2e"]),
+        }
+
+    def _aggregate_port_scope_from_segments(
+        self,
+        seg_scope: pd.DataFrame,
+        metric_cols: List[str],
+        group_by: str,
+        include_uncertainty: bool,
+    ) -> tuple[pd.DataFrame, Optional[pd.DataFrame]]:
+        if seg_scope.empty:
+            return pd.DataFrame(), None
+
+        work = seg_scope.copy()
+        work["date"] = pd.to_datetime(work["timestamp_start"], errors="coerce", utc=True).dt.floor("D")
+        work = work.dropna(subset=["date"])
+        if work.empty:
+            return pd.DataFrame(), None
+
+        if group_by.lower() in {"month", "monthly"}:
+            work["bucket"] = work["date"].dt.to_period("M").astype(str)
+            group_cols = ["bucket", "port_key", "port_label", "locode_norm"]
+        else:
+            work["bucket"] = work["date"]
+            group_cols = ["bucket", "port_key", "port_label", "locode_norm"]
+
+        agg_map: Dict[str, str] = {m: "sum" for m in metric_cols}
+        agg_map.update(
+            {
+                "row_count": "sum",
+                "duration_h": "sum",
+                "fallback_usage_ratio": "mean",
+                "ci_width_rel": "mean",
+                "confidence_reason": "first",
+            }
+        )
+        if include_uncertainty:
+            for m in metric_cols:
+                agg_map[f"{m}_lower"] = "sum"
+                agg_map[f"{m}_upper"] = "sum"
+
+        table = (
+            work.groupby(group_cols, dropna=False)
+            .agg(agg_map)
+            .reset_index()
+            .rename(columns={"bucket": "date"})
+            .sort_values("date")
+        )
+
+        # recompute confidence rows from aggregated uncertainty width + fallback usage.
+        point_col = "wtw_co2e_t" if "wtw_co2e_t" in table.columns else ("ttw_co2e_t" if "ttw_co2e_t" in table.columns else "co2_t")
+        low_col = f"{point_col}_lower"
+        up_col = f"{point_col}_upper"
+        if low_col in table.columns and up_col in table.columns:
+            p = pd.to_numeric(table[point_col], errors="coerce").fillna(0.0)
+            lo = pd.to_numeric(table[low_col], errors="coerce").fillna(0.0)
+            up = pd.to_numeric(table[up_col], errors="coerce").fillna(0.0)
+            table["ci_width_rel"] = np.where(p > 0, (up - lo) / p, 1.0)
+
+        labels: List[str] = []
+        reasons: List[str] = []
+        for ci, fb in zip(
+            pd.to_numeric(table.get("ci_width_rel"), errors="coerce").fillna(1.0),
+            pd.to_numeric(table.get("fallback_usage_ratio"), errors="coerce").fillna(0.0),
+        ):
+            ci_f = float(ci)
+            fb_f = float(fb)
+            if ci_f <= 0.20 and fb_f <= 0.05:
+                labels.append("high")
+            elif ci_f <= 0.40 or fb_f <= 0.20:
+                labels.append("medium")
+            else:
+                labels.append("low")
+            reasons.append(
+                f"CI width={ci_f:.2f}, fallback_ratio={fb_f:.2f}, aggregated from deterministic call-linked segments."
+            )
+        table["confidence_label"] = labels
+        table["confidence_reason"] = reasons
+
+        chart_col = metric_cols[0] if metric_cols else None
+        chart: Optional[pd.DataFrame] = None
+        if chart_col and chart_col in table.columns:
+            if group_by.lower() in {"month", "monthly"}:
+                chart = table.groupby("date", dropna=False)[chart_col].sum().reset_index().set_index("date")
+            else:
+                chart = table.groupby("date", dropna=False)[chart_col].sum().reset_index().set_index("date")
+        return table, chart
+
+    def _build_call_trace_payload(
+        self,
+        call_id: str,
+        mmsi: str,
+        boundary: str,
+    ) -> Dict[str, Any]:
+        seg = self.segments.copy()
+        if seg.empty:
+            return {}
+        seg["call_id"] = seg["call_id"].fillna("").astype(str)
+        seg["mmsi"] = seg["mmsi"].fillna("").astype(str)
+        seg = seg[(seg["call_id"] == str(call_id)) & (seg["mmsi"] == str(mmsi))]
+        if seg.empty:
+            return {}
+
+        seg["timestamp_start"] = pd.to_datetime(seg["timestamp_start"], errors="coerce", utc=True)
+        seg["timestamp_end"] = pd.to_datetime(seg["timestamp_end"], errors="coerce", utc=True)
+        arrival = seg["timestamp_start"].min()
+        departure = seg["timestamp_end"].max()
+        duration_h = float(pd.to_numeric(seg.get("duration_h"), errors="coerce").fillna(0.0).sum())
+        metric = "wtw_co2e_t" if boundary == "WTW" else "ttw_co2e_t"
+        total_t = _sum_col(seg, metric)
+
+        call_counts = self.calls.copy()
+        call_counts["call_id"] = call_counts.get("call_id", "").fillna("").astype(str)
+        counted_once = int((call_counts["call_id"] == str(call_id)).sum()) == 1 if not call_counts.empty else False
+
+        return {
+            "call_id": call_id,
+            "mmsi": mmsi,
+            "arrival_utc": arrival.strftime("%Y-%m-%dT%H:%M:%SZ") if pd.notna(arrival) else None,
+            "departure_utc": departure.strftime("%Y-%m-%dT%H:%M:%SZ") if pd.notna(departure) else None,
+            "duration_hours": duration_h,
+            "vessel_class": str(seg["vessel_class"].dropna().iloc[0]) if "vessel_class" in seg.columns and seg["vessel_class"].notna().any() else "unknown",
+            "proxy_class": str(seg["vessel_class"].dropna().iloc[0]) if "vessel_class" in seg.columns and seg["vessel_class"].notna().any() else "unknown",
+            "fuel_t": _sum_col(seg, "fuel_t"),
+            "ttw_co2_t": _sum_col(seg, "co2_t"),
+            "wtt_co2e_t": _sum_col(seg, "wtt_co2e_t"),
+            "ch4_co2e_t": 0.0,
+            "n2o_co2e_t": 0.0,
+            "final_total_tco2e_t": total_t,
+            "final_total_kgco2e": total_t * 1000.0,
+            "counted_once": counted_once,
+            "segment_count": int(len(seg)),
+        }
 
     def _write_exports(self, prefix: str, table: pd.DataFrame, payload: Dict[str, Any]) -> tuple[Optional[str], Optional[str]]:
         stamp = pd.Timestamp.utcnow().strftime("%Y%m%dT%H%M%SZ")
@@ -278,41 +564,81 @@ class CarbonQueryEngine:
             if pd.notna(from_ts) and pd.notna(to_ts) and from_ts > to_ts:
                 return self._no_data("Invalid date range: from > to.", boundary=boundary, pollutants=pollutants_list)
         if not self.available:
-            return self._no_data("Carbon outputs are not available.", boundary=boundary, pollutants=pollutants_list)
+            return self._no_data(
+                "Carbon outputs are not available.",
+                boundary=boundary,
+                pollutants=pollutants_list,
+                result_state=CARBON_STATE_NOT_COMPUTABLE,
+            )
 
-        work = _port_filter(self.daily_port, port_id)
-        work = _date_filter(work, "date", date_from, date_to)
-        if work.empty:
-            return self._no_data("No carbon rows matched the requested port/date filters.", boundary, pollutants_list)
+        seg_scope_all = self._filtered_segments_scope(port_id=port_id, date_from=date_from, date_to=date_to)
+        if seg_scope_all.empty:
+            return self._no_data(
+                "No carbon segment rows matched the requested port/date filters.",
+                boundary=boundary,
+                pollutants=pollutants_list,
+                result_state=CARBON_STATE_NOT_COMPUTABLE,
+                diagnostics=self._build_scope_diagnostics(pd.DataFrame(), metric_col="ttw_co2e_t"),
+            )
+        if "segment_id" in seg_scope_all.columns:
+            seg_scope_all = seg_scope_all.drop_duplicates(subset=["segment_id"], keep="first")
+
+        # Deterministic inventory must be call-linked; destination-only proxy segments are not used as numeric truth.
+        deterministic = seg_scope_all[
+            seg_scope_all["call_id"].notna() & (seg_scope_all["call_id"].astype(str) != "")
+        ].copy()
 
         metric_cols = [_metric_column(pol, boundary) for pol in pollutants_list]
-        table_cols = ["date", "port_key", "port_label", "locode_norm", "confidence_label", "confidence_reason"] + metric_cols
-        if include_uncertainty:
-            for metric in metric_cols:
-                table_cols.extend([f"{metric}_lower", f"{metric}_upper"])
-        table_cols = [c for c in table_cols if c in work.columns]
-        table = work[table_cols].copy().sort_values("date")
+        metric_primary = metric_cols[0] if metric_cols else ("wtw_co2e_t" if boundary == "WTW" else "ttw_co2e_t")
 
-        if group_by.lower() in {"month", "monthly"}:
-            month = pd.to_datetime(table["date"], errors="coerce", utc=True).dt.to_period("M").astype(str)
-            agg_map = {m: "sum" for m in metric_cols}
-            if include_uncertainty:
-                for m in metric_cols:
-                    agg_map[f"{m}_lower"] = "sum"
-                    agg_map[f"{m}_upper"] = "sum"
-            agg = table.assign(month=month).groupby("month", dropna=False).agg(agg_map).reset_index()
-            chart = agg.set_index("month")[[metric_cols[0]]] if metric_cols else None
-            table = agg
-        else:
-            chart = table.set_index("date")[[metric_cols[0]]] if metric_cols and "date" in table.columns else None
+        baseline_scope = _port_filter(self.daily_port.copy(), port_id)
+        baseline_values = (
+            pd.to_numeric(baseline_scope.get(metric_primary), errors="coerce").dropna().tolist()
+            if metric_primary in baseline_scope.columns
+            else []
+        )
+        if deterministic.empty:
+            diagnostics = self._build_scope_diagnostics(
+                seg_scope_all,
+                metric_col=metric_primary,
+                baseline_values=baseline_values,
+            )
+            diagnostics["reason"] = "No call-linked segments matched; deterministic carbon computation unavailable."
+            return self._no_data(
+                "No deterministic carbon rows matched the requested scope.",
+                boundary=boundary,
+                pollutants=pollutants_list,
+                result_state=CARBON_STATE_NOT_COMPUTABLE,
+                diagnostics=diagnostics,
+            )
 
-        uncertainty = self._build_uncertainty_summary(work, pollutants_list, boundary) if include_uncertainty else {}
+        table, chart = self._aggregate_port_scope_from_segments(
+            seg_scope=deterministic,
+            metric_cols=metric_cols,
+            group_by=group_by,
+            include_uncertainty=include_uncertainty,
+        )
+        if table.empty:
+            diagnostics = self._build_scope_diagnostics(
+                deterministic,
+                metric_col=metric_primary,
+                baseline_values=baseline_values,
+            )
+            return self._no_data(
+                "Deterministic carbon aggregation returned no rows for this scope.",
+                boundary=boundary,
+                pollutants=pollutants_list,
+                result_state=CARBON_STATE_NOT_COMPUTABLE,
+                diagnostics=diagnostics,
+            )
+
+        uncertainty = self._build_uncertainty_summary(deterministic, pollutants_list, boundary) if include_uncertainty else {}
         total_co2e_key = "CO2e" if "CO2e" in uncertainty else pollutants_list[0]
         total_point = float(uncertainty.get(total_co2e_key, {}).get("point", 0.0))
         total_low = float(uncertainty.get(total_co2e_key, {}).get("lower", 0.0))
         total_up = float(uncertainty.get(total_co2e_key, {}).get("upper", 0.0))
-        ci_width_rel = (total_up - total_low) / total_point if total_point > 0 else 1.0
-        fallback_ratio = float(pd.to_numeric(work.get("fallback_usage_ratio"), errors="coerce").fillna(0).mean())
+        ci_width_rel = (total_up - total_low) / total_point if total_point > 0 else 0.0
+        fallback_ratio = float(pd.to_numeric(deterministic.get("fallback_usage_ratio"), errors="coerce").fillna(0.0).mean())
         source_label = (
             "Computed with fallback defaults"
             if fallback_ratio > 0.15
@@ -327,49 +653,73 @@ class CarbonQueryEngine:
         )
         conf_reason = (
             f"CI width={ci_width_rel:.2f}, fallback_ratio={fallback_ratio:.2f}, "
-            f"rows={len(work):,}, group_by={group_by}."
+            f"segments={len(deterministic):,}, group_by={group_by}."
         )
+        result_state = CARBON_STATE_COMPUTED_ZERO if abs(total_point) < 1e-12 else CARBON_STATE_COMPUTED
+
+        diagnostics = self._build_scope_diagnostics(
+            deterministic,
+            metric_col=metric_primary,
+            baseline_values=baseline_values,
+        )
+        diagnostics["result_state"] = result_state
+        diagnostics["reconciliation_total_tco2e"] = total_point
+        diagnostics["reconciliation_total_from_unique_calls_tco2e"] = _sum_col(
+            deterministic.groupby("call_id", dropna=False)[metric_primary].sum().reset_index(),
+            metric_primary,
+        )
+        diagnostics["reconciliation_unique_call_count"] = int(deterministic["call_id"].astype(str).nunique())
 
         evidence_ids: List[str] = []
         segment_ids: List[str] = []
         if include_evidence and not self.evidence.empty:
+            seg_ids_all = set(deterministic["segment_id"].astype(str).tolist()) if "segment_id" in deterministic.columns else set()
             edf = _port_filter(self.evidence, port_id)
             edf = _date_filter(edf, "timestamp_start", date_from, date_to)
+            if seg_ids_all and "segment_id" in edf.columns:
+                edf = edf[edf["segment_id"].astype(str).isin(seg_ids_all)]
             if not edf.empty and "evidence_id" in edf.columns:
-                evidence_ids = edf["evidence_id"].astype(str).head(25).tolist()
+                evidence_ids = edf["evidence_id"].astype(str).head(50).tolist()
                 if "segment_id" in edf.columns:
-                    segment_ids = edf["segment_id"].astype(str).head(25).tolist()
+                    segment_ids = edf["segment_id"].astype(str).head(50).tolist()
 
         port_label = port_id or "the selected scope"
         answer = (
-            f"{boundary} emissions for {port_label} were computed from deterministic segmentation. "
+            f"{boundary} emissions for {port_label} were computed from deterministic call-linked segmentation. "
             f"Total {total_co2e_key}={total_point:.2f} tCO2e ({total_low:.2f}-{total_up:.2f} tCO2e)."
         )
         coverage = [
-            f"Coverage rows: {len(work):,}",
+            f"Coverage segments: {len(deterministic):,}",
+            f"Unique vessel-calls: {diagnostics.get('unique_vessel_calls', 0):,}",
             f"Boundary: {boundary}",
             f"Pollutants: {', '.join(pollutants_list)}",
             f"Group by: {group_by}",
             "Source label: " + source_label,
             f"Fallback usage ratio: {fallback_ratio:.2f}",
+            "Reconciliation: total displayed emissions equal the sum of unique call-linked emissions.",
+            "Reconciliation: intensity denominator uses unique vessel-call count.",
             "Unit standard: absolute greenhouse-gas values are expressed in tCO2e.",
         ]
         caveats = [
             "Confidence expresses evidence/assumption strength, not certainty.",
-            "Carbon estimates use deterministic heuristics with mode segmentation and local factor pack.",
-            "Results are estimated and proxy-based inventory outputs, not direct stack measurements.",
+            "Carbon estimates are deterministic but proxy-based inventory outputs, not direct stack measurements.",
+            "Dataset-relative thresholds are used unless external regulatory thresholds are configured.",
         ]
+        for w in diagnostics.get("warnings", [])[:4]:
+            caveats.append(f"Sanity warning: {w}")
 
         payload = {
             "boundary": boundary,
             "pollutants": pollutants_list,
             "source_label": source_label,
+            "result_state": result_state,
             "confidence_label": conf,
             "confidence_reason": conf_reason,
             "uncertainty_interval": uncertainty,
             "params_version": str(self.params_version.get("version", "unknown")),
             "evidence_ids": evidence_ids,
             "segment_ids": segment_ids,
+            "diagnostics": diagnostics,
             "units": {
                 "absolute_emissions": "tCO2e",
                 "intensity_examples": ["kgCO2e/vessel-call", "tCO2e/day", "kgCO2e/hour"],
@@ -399,6 +749,8 @@ class CarbonQueryEngine:
             params_version=str(self.params_version.get("version", "unknown")),
             evidence_ids=evidence_ids,
             segment_ids=segment_ids,
+            result_state=result_state,
+            diagnostics=diagnostics,
             export_csv_path=export_csv,
             export_json_path=export_json,
         )
@@ -415,18 +767,34 @@ class CarbonQueryEngine:
         boundary = _norm_boundary(boundary)
         pollutants_list = _norm_pollutants(pollutants)
         if not self.available:
-            return self._no_data("Carbon outputs are not available.", boundary=boundary, pollutants=pollutants_list)
+            return self._no_data(
+                "Carbon outputs are not available.",
+                boundary=boundary,
+                pollutants=pollutants_list,
+                result_state=CARBON_STATE_NOT_COMPUTABLE,
+            )
 
         calls = self.calls.copy()
         if calls.empty:
-            return self._no_data("No call-level carbon table available.", boundary, pollutants_list)
+            return self._no_data(
+                "No call-level carbon table available.",
+                boundary=boundary,
+                pollutants=pollutants_list,
+                result_state=CARBON_STATE_NOT_COMPUTABLE,
+            )
         calls["mmsi"] = calls["mmsi"].fillna("").astype(str)
         calls["call_id"] = calls["call_id"].fillna("").astype(str)
         work = calls[(calls["mmsi"] == str(mmsi)) & (calls["call_id"] == str(call_id))]
         if work.empty:
-            return self._no_data("No matching call_id/mmsi carbon rows found.", boundary, pollutants_list)
+            return self._no_data(
+                "No matching call_id/mmsi carbon rows found.",
+                boundary=boundary,
+                pollutants=pollutants_list,
+                result_state=CARBON_STATE_NOT_COMPUTABLE,
+            )
 
         metric_cols = [_metric_column(pol, boundary) for pol in pollutants_list]
+        metric_primary = metric_cols[0] if metric_cols else ("wtw_co2e_t" if boundary == "WTW" else "ttw_co2e_t")
         cols = ["call_id", "mmsi", "port_key", "port_label", "locode_norm", "confidence_label", "confidence_reason"] + metric_cols
         if include_uncertainty:
             for metric in metric_cols:
@@ -451,6 +819,9 @@ class CarbonQueryEngine:
             else "low"
         )
         conf_reason = f"CI width={ci_width_rel:.2f}, fallback_ratio={fallback_ratio:.2f}."
+        total_co2e_key = "CO2e" if "CO2e" in uncertainty else (pollutants_list[0] if pollutants_list else "CO2e")
+        total_point = float(uncertainty.get(total_co2e_key, {}).get("point", _sum_col(work, metric_primary)))
+        result_state = CARBON_STATE_COMPUTED_ZERO if abs(total_point) < 1e-12 else CARBON_STATE_COMPUTED
 
         evidence_ids: List[str] = []
         segment_ids: List[str] = []
@@ -464,6 +835,35 @@ class CarbonQueryEngine:
                 if "segment_id" in ev.columns:
                     segment_ids = ev["segment_id"].astype(str).head(30).tolist()
 
+        seg_scope = self.segments.copy()
+        if not seg_scope.empty:
+            seg_scope["mmsi"] = seg_scope["mmsi"].fillna("").astype(str)
+            seg_scope["call_id"] = seg_scope["call_id"].fillna("").astype(str)
+            seg_scope = seg_scope[(seg_scope["mmsi"] == str(mmsi)) & (seg_scope["call_id"] == str(call_id))]
+            if "segment_id" in seg_scope.columns:
+                seg_scope = seg_scope.drop_duplicates(subset=["segment_id"], keep="first")
+
+        baseline_scope = self.daily_port.copy()
+        if not baseline_scope.empty and "port_key" in baseline_scope.columns and "port_key" in work.columns:
+            port_key = str(work["port_key"].iloc[0]) if pd.notna(work["port_key"].iloc[0]) else ""
+            if port_key:
+                baseline_scope = baseline_scope[baseline_scope["port_key"].astype(str) == port_key]
+        baseline_values = (
+            pd.to_numeric(baseline_scope.get(metric_primary), errors="coerce").dropna().tolist()
+            if metric_primary in baseline_scope.columns
+            else []
+        )
+        diagnostics = self._build_scope_diagnostics(
+            seg_scope=seg_scope,
+            metric_col=metric_primary,
+            baseline_values=baseline_values,
+        )
+        diagnostics["trace_single_call"] = self._build_call_trace_payload(call_id=call_id, mmsi=mmsi, boundary=boundary)
+        diagnostics["result_state"] = result_state
+        diagnostics["reconciliation_total_tco2e"] = total_point
+        diagnostics["reconciliation_total_from_unique_calls_tco2e"] = _sum_col(work, metric_primary)
+        diagnostics["reconciliation_unique_call_count"] = 1
+
         answer = (
             f"{boundary} emissions for call `{call_id}` (MMSI {mmsi}) were computed deterministically "
             "with greenhouse-gas values reported as tCO2e."
@@ -472,12 +872,14 @@ class CarbonQueryEngine:
             "boundary": boundary,
             "pollutants": pollutants_list,
             "source_label": source_label,
+            "result_state": result_state,
             "confidence_label": conf,
             "confidence_reason": conf_reason,
             "uncertainty_interval": uncertainty,
             "params_version": str(self.params_version.get("version", "unknown")),
             "evidence_ids": evidence_ids,
             "segment_ids": segment_ids,
+            "diagnostics": diagnostics,
             "units": {
                 "absolute_emissions": "tCO2e",
                 "intensity_examples": ["kgCO2e/vessel-call", "tCO2e/day", "kgCO2e/hour"],
@@ -501,6 +903,7 @@ class CarbonQueryEngine:
             chart=chart,
             coverage_notes=[
                 f"Rows used: {len(work)}",
+                "Unique vessel-calls: 1",
                 f"Boundary: {boundary}",
                 f"Fallback usage ratio: {fallback_ratio:.2f}",
                 "Unit standard: absolute greenhouse-gas values are expressed in tCO2e.",
@@ -515,6 +918,8 @@ class CarbonQueryEngine:
             params_version=str(self.params_version.get("version", "unknown")),
             evidence_ids=evidence_ids,
             segment_ids=segment_ids,
+            result_state=result_state,
+            diagnostics=diagnostics,
             export_csv_path=export_csv,
             export_json_path=export_json,
         )
@@ -608,6 +1013,11 @@ class CarbonQueryEngine:
         caveats = ["Estimate is scenario-based and not a direct measured inventory."]
         if not export_csv or not export_json:
             caveats.append("Export files were skipped because runtime storage is read-only.")
+        computed_state = (
+            CARBON_STATE_COMPUTED_ZERO
+            if abs(float(row["wtw_co2e_t"].iloc[0] if boundary == "WTW" else row["ttw_co2e_t"].iloc[0])) < 1e-12
+            else CARBON_STATE_COMPUTED
+        )
         return CarbonResult(
             status="ok",
             answer=answer,
@@ -629,6 +1039,13 @@ class CarbonQueryEngine:
             params_version=str(self.params_version.get("version", "unknown")),
             evidence_ids=[],
             segment_ids=[],
+            result_state=computed_state,
+            diagnostics={
+                "result_state": computed_state,
+                "sanity_status": "checked",
+                "warnings": [],
+                "trace_assumptions": payload,
+            },
             export_csv_path=export_csv,
             export_json_path=export_json,
         )
@@ -672,6 +1089,23 @@ class CarbonQueryEngine:
                 pollutants=pollutants,
                 include_uncertainty=True,
                 include_evidence=True,
+            )
+
+        if any(token in q for token in ("forecast", "predict", "expected", "future", "next", "coming", "will")) and not (
+            date_from or date_to
+        ):
+            return self._no_data(
+                "Carbon forecast was requested, but deterministic carbon forecast outputs are not available in this runtime.",
+                boundary=boundary,
+                pollutants=pollutants,
+                result_state=CARBON_STATE_FORECAST_ONLY,
+                diagnostics={
+                    "result_state": CARBON_STATE_FORECAST_ONLY,
+                    "sanity_status": "unstable baseline",
+                    "warnings": [
+                        "Forecast-only carbon request: no deterministic carbon forecast model available.",
+                    ],
+                },
             )
 
         group_by = "month" if ("monthly" in q or "per month" in q) else "day"

@@ -12,7 +12,16 @@ import pandas as pd
 from fastapi import FastAPI, HTTPException, Query
 from pydantic import BaseModel, Field
 
-from src.carbon.query import CarbonQueryEngine, CarbonResult
+from src.carbon.query import (
+    CARBON_STATE_COMPUTED,
+    CARBON_STATE_COMPUTED_ZERO,
+    CARBON_STATE_FORECAST_ONLY,
+    CARBON_STATE_NOT_COMPUTABLE,
+    CARBON_STATE_RETRIEVAL_ONLY,
+    CARBON_STATE_UNSUPPORTED,
+    CarbonQueryEngine,
+    CarbonResult,
+)
 from src.carbon.presentation import (
     build_emissions_findings,
     build_reduction_suggestions,
@@ -22,6 +31,7 @@ from src.carbon.presentation import (
     extract_chart_findings,
     format_percent,
     format_tco2e,
+    safe_percent_delta,
     sanitize_threshold_percentiles,
 )
 from src.forecast.forecast import ForecastEngine, ForecastResult
@@ -315,6 +325,12 @@ def _fallback_evidence_from_result(
 
 def _extract_confidence_label(value: Union[AnalyticsResult, ForecastResult, CarbonResult]) -> str:
     if isinstance(value, CarbonResult):
+        if value.result_state in {CARBON_STATE_NOT_COMPUTABLE, CARBON_STATE_UNSUPPORTED}:
+            return "low / unavailable (deterministic carbon computation unavailable for this scope)"
+        if value.result_state == CARBON_STATE_RETRIEVAL_ONLY:
+            return "retrieval-only (supporting traffic evidence found, not numeric carbon source-of-truth)"
+        if value.result_state == CARBON_STATE_FORECAST_ONLY:
+            return "unavailable (carbon forecast requested but deterministic carbon forecast is not configured)"
         return f"{value.confidence_label} ({value.confidence_reason})"
     if value.status != "ok":
         return "low (insufficient matched data/evidence)"
@@ -329,6 +345,16 @@ def _extract_confidence_label(value: Union[AnalyticsResult, ForecastResult, Carb
 def _build_method_steps(value: Union[AnalyticsResult, ForecastResult, CarbonResult]) -> List[str]:
     steps: List[str] = []
     if isinstance(value, CarbonResult):
+        steps.append(f"Result state: {value.result_state}.")
+        if value.result_state not in {CARBON_STATE_COMPUTED, CARBON_STATE_COMPUTED_ZERO}:
+            steps.append("Deterministic carbon computation: unavailable for this scope.")
+            if value.result_state == CARBON_STATE_RETRIEVAL_ONLY:
+                steps.append("Retrieved evidence is traffic-only context and not numeric carbon source-of-truth.")
+            elif value.result_state == CARBON_STATE_FORECAST_ONLY:
+                steps.append("Forecast-only carbon query detected; no deterministic carbon forecast model configured.")
+            for note in value.coverage_notes[:4]:
+                steps.append(note)
+            return steps
         steps.append("Applied deterministic AIS + port-call mode segmentation (transit/manoeuvring/berth/anchorage).")
         steps.append(f"Boundary: {value.boundary}; Pollutants: {', '.join(value.pollutants)}.")
         steps.append(f"Source label: {value.source_label}.")
@@ -377,6 +403,12 @@ def _build_method_steps(value: Union[AnalyticsResult, ForecastResult, CarbonResu
 def _build_port_actions(value: Union[AnalyticsResult, ForecastResult, CarbonResult]) -> List[str]:
     actions: List[str] = []
     if isinstance(value, CarbonResult):
+        if value.result_state not in {CARBON_STATE_COMPUTED, CARBON_STATE_COMPUTED_ZERO}:
+            return [
+                "Improve carbon data coverage for the selected scope before interpreting emissions numerically.",
+                "Add validated vessel fuel/engine/activity factors for periods with missing deterministic carbon rows.",
+                "Use retrieved traffic evidence as context only until deterministic carbon inventory is available.",
+            ]
         metric = value.uncertainty_interval.get("CO2e") or value.uncertainty_interval.get("CO2") or {}
         point = float(metric.get("point", 0.0))
         upper = float(metric.get("upper", point))
@@ -498,8 +530,22 @@ def _handle_ask_question_api(
             top_k_evidence,
             True,
         )
-        if result.status == "ok" and evidence.rows:
-            result.source_label = "Hybrid (computed + retrieved supporting evidence)"
+        if isinstance(result, CarbonResult):
+            if result.result_state == CARBON_STATE_NOT_COMPUTABLE and evidence.rows:
+                result.result_state = CARBON_STATE_RETRIEVAL_ONLY
+                result.source_label = "Retrieved supporting traffic evidence only (no deterministic carbon computation)"
+                result.confidence_label = "low"
+                result.confidence_reason = (
+                    "Retrieval-only evidence is available; deterministic carbon inventory is not computable for this scope."
+                )
+                result.coverage_notes.append(
+                    "Traffic evidence was retrieved, but numeric carbon emissions could not be computed reliably."
+                )
+                result.diagnostics = dict(result.diagnostics or {})
+                result.diagnostics["result_state"] = CARBON_STATE_RETRIEVAL_ONLY
+                result.diagnostics["sanity_status"] = result.diagnostics.get("sanity_status", "warning")
+            elif result.status == "ok" and evidence.rows and result.result_state in {CARBON_STATE_COMPUTED, CARBON_STATE_COMPUTED_ZERO}:
+                result.source_label = "Hybrid (computed + retrieved supporting evidence)"
         return result, evidence
 
     if intent_result.intent == "A":
@@ -661,6 +707,78 @@ def _serialize_result(
         "retrieval_provenance": evidence.trace,
     }
     if isinstance(result, CarbonResult):
+        computed_states = {CARBON_STATE_COMPUTED, CARBON_STATE_COMPUTED_ZERO}
+        is_computed = result.result_state in computed_states
+        diagnostics = dict(result.diagnostics or {})
+        min_baseline_denominator = 1.0
+        try:
+            min_baseline_denominator = float(diagnostics.get("min_baseline_denominator_tco2e", 1.0))
+        except Exception:
+            min_baseline_denominator = 1.0
+        payload["carbon"] = {
+            "result_state": result.result_state,
+            "boundary": result.boundary,
+            "pollutants": result.pollutants,
+            "source_label": result.source_label,
+            "confidence_label": result.confidence_label,
+            "confidence_reason": result.confidence_reason,
+            "uncertainty_interval": result.uncertainty_interval,
+            "params_version": result.params_version,
+            "evidence_ids": result.evidence_ids,
+            "segment_ids": result.segment_ids,
+            "diagnostics": diagnostics,
+            "export_csv_path": result.export_csv_path,
+            "export_json_path": result.export_json_path,
+            "units": {
+                "absolute_emissions": "tCO2e (auto-scales to ktCO2e/MtCO2e in UI)",
+                "intensity_per_call": "kgCO2e/vessel-call",
+                "per_day": "tCO2e/day",
+                "per_hour": "kgCO2e/hour",
+                "threshold_basis": "relative to this dataset",
+            },
+            "deterministic_carbon_evidence": _fallback_evidence_from_result(result),
+            "retrieved_supporting_traffic_evidence": evidence.lines,
+        }
+        if not is_computed:
+            payload["chart"] = None
+            state_reason = {
+                CARBON_STATE_NOT_COMPUTABLE: "No deterministic carbon inventory matched the requested scope.",
+                CARBON_STATE_RETRIEVAL_ONLY: "Traffic evidence was retrieved, but numeric carbon emissions could not be computed reliably.",
+                CARBON_STATE_FORECAST_ONLY: "Carbon forecast was requested, but deterministic carbon forecast outputs are unavailable.",
+                CARBON_STATE_UNSUPPORTED: "Carbon query is outside the supported deterministic scope.",
+            }.get(result.result_state, "No deterministic carbon output is available for this scope.")
+            suggestions = [
+                "Improve carbon data coverage for this scope before interpreting emissions numerically.",
+                "Add validated fuel/engine/activity factors before interpreting carbon totals.",
+                "Use retrieved traffic evidence as context only, not as numeric carbon truth.",
+            ]
+            payload["carbon"]["availability"] = {
+                "computable": False,
+                "message": state_reason,
+            }
+            payload["carbon"]["relative_scale"] = None
+            payload["carbon"]["metrics"] = {
+                "total_emissions": None,
+                "intensity_kgco2e_per_vessel_call": None,
+                "tco2e_per_day": None,
+                "kgco2e_per_hour": None,
+                "relative_level": None,
+                "change_vs_baseline": None,
+                "change_vs_historical_median": None,
+            }
+            payload["carbon"]["findings"] = [
+                {"type": "status", "text": state_reason},
+                {
+                    "type": "status",
+                    "text": "Retrieved traffic evidence is contextual and does not provide deterministic numeric carbon accounting.",
+                }
+                if result.result_state == CARBON_STATE_RETRIEVAL_ONLY
+                else {"type": "status", "text": "Interpret this response as unavailable rather than low-emission."},
+            ]
+            payload["carbon"]["emissions_reduction_suggestions"] = suggestions
+            payload["recommendations"] = suggestions
+            return payload
+
         metrics = compute_emissions_metrics(result.table, result.boundary)
         total = float(metrics.get("total_tco2e") or 0.0)
         table_metric_col = "wtw_co2e_t" if result.boundary == "WTW" else "ttw_co2e_t"
@@ -674,7 +792,17 @@ def _serialize_result(
         bands = derive_threshold_bands(hist_values, percentiles=threshold_percentiles)
         level = classify_level(total, bands)
         hist_median = float(np.median(hist_values)) if hist_values else None
-        change_vs_median_pct = (((total - hist_median) / hist_median) * 100.0) if hist_median and hist_median > 0 else None
+        hist_mean = float(np.mean(hist_values)) if hist_values else None
+        change_vs_median_pct = safe_percent_delta(
+            current_value=total,
+            baseline_value=hist_median,
+            min_denominator=min_baseline_denominator,
+        )
+        change_vs_baseline_pct = safe_percent_delta(
+            current_value=total,
+            baseline_value=hist_mean,
+            min_denominator=min_baseline_denominator,
+        )
         ci_item = result.uncertainty_interval.get("CO2e") or result.uncertainty_interval.get("CO2") or {}
         point = float(ci_item.get("point", 0.0))
         lower = float(ci_item.get("lower", 0.0))
@@ -690,64 +818,52 @@ def _serialize_result(
             ci_width_rel=ci_width_rel,
             chart_findings=chart_findings,
         )
+        if change_vs_baseline_pct is None or change_vs_median_pct is None:
+            findings.append(
+                {
+                    "type": "inferred",
+                    "text": "Baseline denominator is too small for meaningful percentage comparison in this scope.",
+                }
+            )
         suggestions = build_reduction_suggestions(
             level=level,
             change_vs_median_pct=change_vs_median_pct,
             ci_width_rel=ci_width_rel,
             source_label=result.source_label,
         )
-
-        payload["carbon"] = {
-            "boundary": result.boundary,
-            "pollutants": result.pollutants,
-            "source_label": result.source_label,
-            "confidence_label": result.confidence_label,
-            "confidence_reason": result.confidence_reason,
-            "uncertainty_interval": result.uncertainty_interval,
-            "params_version": result.params_version,
-            "evidence_ids": result.evidence_ids,
-            "segment_ids": result.segment_ids,
-            "export_csv_path": result.export_csv_path,
-            "export_json_path": result.export_json_path,
-            "units": {
-                "absolute_emissions": "tCO2e (auto-scales to ktCO2e/MtCO2e in UI)",
-                "intensity_per_call": "kgCO2e/vessel-call",
-                "per_day": "tCO2e/day",
-                "per_hour": "kgCO2e/hour",
-                "threshold_basis": bands.source_label,
-            },
-            "relative_scale": {
-                "classification": level,
-                "basis": bands.source_label,
-                "thresholds_tco2e": {"p25": bands.p25, "p50": bands.p50, "p75": bands.p75},
-                "current_tco2e": total,
-                "current_display": format_tco2e(total),
-            },
-            "metrics": {
-                "total_emissions": format_tco2e(total),
-                "intensity_kgco2e_per_vessel_call": (
-                    f"{float(metrics['intensity_kg_per_call']):.1f} kgCO2e/vessel-call"
-                    if metrics.get("intensity_kg_per_call") is not None
-                    else None
-                ),
-                "tco2e_per_day": (
-                    f"{float(metrics['tco2e_per_day']):.2f} tCO2e/day"
-                    if metrics.get("tco2e_per_day") is not None
-                    else None
-                ),
-                "kgco2e_per_hour": (
-                    f"{float(metrics['kgco2e_per_hour']):.2f} kgCO2e/hour"
-                    if metrics.get("kgco2e_per_hour") is not None
-                    else None
-                ),
-                "relative_level": level,
-                "change_vs_historical_median": (
-                    format_percent(change_vs_median_pct) if change_vs_median_pct is not None else None
-                ),
-            },
-            "findings": findings,
-            "emissions_reduction_suggestions": suggestions,
+        payload["carbon"]["availability"] = {"computable": True, "message": "Deterministic carbon inventory computed."}
+        payload["carbon"]["relative_scale"] = {
+            "classification": level,
+            "basis": bands.source_label,
+            "thresholds_tco2e": {"p25": bands.p25, "p50": bands.p50, "p75": bands.p75},
+            "current_tco2e": total,
+            "current_display": format_tco2e(total),
         }
+        payload["carbon"]["metrics"] = {
+            "total_emissions": format_tco2e(total),
+            "intensity_kgco2e_per_vessel_call": (
+                f"{float(metrics['intensity_kg_per_call']):.1f} kgCO2e/vessel-call"
+                if metrics.get("intensity_kg_per_call") is not None
+                else None
+            ),
+            "tco2e_per_day": (
+                f"{float(metrics['tco2e_per_day']):.2f} tCO2e/day"
+                if metrics.get("tco2e_per_day") is not None
+                else None
+            ),
+            "kgco2e_per_hour": (
+                f"{float(metrics['kgco2e_per_hour']):.2f} kgCO2e/hour"
+                if metrics.get("kgco2e_per_hour") is not None
+                else None
+            ),
+            "relative_level": level,
+            "change_vs_baseline": format_percent(change_vs_baseline_pct) if change_vs_baseline_pct is not None else None,
+            "change_vs_historical_median": (
+                format_percent(change_vs_median_pct) if change_vs_median_pct is not None else None
+            ),
+        }
+        payload["carbon"]["findings"] = findings
+        payload["carbon"]["emissions_reduction_suggestions"] = suggestions
         payload["recommendations"] = suggestions
     return payload
 

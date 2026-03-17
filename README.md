@@ -278,6 +278,19 @@ Carbon result views now include:
 - chart annotations (`Finding: ...`) for highest/lowest/spike/drop/selected period
 - deterministic `Findings` panel
 - `How To Reduce Emissions` panel with 3-5 operational actions tied to the current pattern
+- strict carbon result-state gating:
+  - `COMPUTED`
+  - `COMPUTED_ZERO`
+  - `NOT_COMPUTABLE`
+  - `RETRIEVAL_ONLY`
+  - `FORECAST_ONLY`
+  - `UNSUPPORTED`
+
+For non-computable carbon states (`NOT_COMPUTABLE`, `RETRIEVAL_ONLY`, `FORECAST_ONLY`, `UNSUPPORTED`):
+- numeric emissions cards are shown as `N/A` (never fake `0.00 tCO2e`)
+- percentage deltas and relative level bars are suppressed
+- deterministic and retrieved evidence are shown in separate blocks
+- findings and recommendations switch to data-quality guidance
 
 Configurable threshold source (single place):
 - `config/config.yaml` -> `carbon.relative_level_percentiles` (default `[0.25, 0.50, 0.75]`)
