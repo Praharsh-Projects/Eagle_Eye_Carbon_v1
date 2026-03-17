@@ -63,15 +63,29 @@ def _port_filter(df: pd.DataFrame, port_token: Optional[str]) -> pd.DataFrame:
     if df.empty or not port_token:
         return df
     token = str(port_token).strip()
-    code = token.upper().replace(" ", "")
+    code = re.sub(r"[^A-Z0-9]", "", token.upper())
     low = token.lower()
     mask = pd.Series(False, index=df.index)
     if "port_key" in df.columns:
-        mask |= df["port_key"].fillna("").astype(str).str.upper() == code
+        port_key = df["port_key"].fillna("").astype(str)
+        port_key_upper = port_key.str.upper()
+        port_key_norm = port_key_upper.str.replace(r"[^A-Z0-9]", "", regex=True)
+        mask |= port_key_upper == code
+        mask |= port_key_norm == code
+        if code:
+            mask |= port_key_norm.str.contains(code, regex=False)
+        if low:
+            mask |= port_key.str.lower().str.contains(low, regex=False)
     if "locode_norm" in df.columns:
-        mask |= df["locode_norm"].fillna("").astype(str).str.upper() == code
+        locode = df["locode_norm"].fillna("").astype(str).str.upper().str.replace(r"[^A-Z0-9]", "", regex=True)
+        mask |= locode == code
     if "port_label" in df.columns:
-        mask |= df["port_label"].fillna("").astype(str).str.lower().str.contains(low, regex=False)
+        port_label = df["port_label"].fillna("").astype(str)
+        port_label_norm = port_label.str.upper().str.replace(r"[^A-Z0-9]", "", regex=True)
+        if low:
+            mask |= port_label.str.lower().str.contains(low, regex=False)
+        if code:
+            mask |= port_label_norm.str.contains(code, regex=False)
     return df[mask]
 
 
@@ -84,7 +98,10 @@ def _date_filter(df: pd.DataFrame, date_col: str, date_from: Optional[str], date
         work = work[dates >= pd.Timestamp(date_from, tz="UTC")]
         dates = pd.to_datetime(work[date_col], errors="coerce", utc=True)
     if date_to:
-        work = work[dates <= pd.Timestamp(date_to, tz="UTC")]
+        end_ts = pd.Timestamp(date_to, tz="UTC")
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", str(date_to).strip()):
+            end_ts = end_ts + pd.Timedelta(days=1) - pd.Timedelta(microseconds=1)
+        work = work[dates <= end_ts]
     return work
 
 
@@ -92,6 +109,12 @@ def _sum_col(df: pd.DataFrame, col: str) -> float:
     if col not in df.columns:
         return 0.0
     return float(pd.to_numeric(df[col], errors="coerce").fillna(0.0).sum())
+
+
+def _numeric_series(df: pd.DataFrame, col: str) -> pd.Series:
+    if col in df.columns:
+        return pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+    return pd.Series(np.zeros(len(df), dtype="float64"), index=df.index)
 
 
 def _mean_col(df: pd.DataFrame, col: str) -> float:
@@ -284,9 +307,9 @@ class CarbonQueryEngine:
             metric = _metric_column(pol, boundary)
             lower_col = f"{metric}_lower"
             upper_col = f"{metric}_upper"
-            point = float(pd.to_numeric(df.get(metric, 0), errors="coerce").fillna(0).sum())
-            lower = float(pd.to_numeric(df.get(lower_col, 0), errors="coerce").fillna(0).sum())
-            upper = float(pd.to_numeric(df.get(upper_col, 0), errors="coerce").fillna(0).sum())
+            point = float(_numeric_series(df, metric).sum())
+            lower = float(_numeric_series(df, lower_col).sum())
+            upper = float(_numeric_series(df, upper_col).sum())
             summary[pol] = {"point": point, "lower": lower, "upper": upper}
         return summary
 
@@ -597,27 +620,81 @@ class CarbonQueryEngine:
             if metric_primary in baseline_scope.columns
             else []
         )
+        used_proxy_daily = False
         if deterministic.empty:
-            diagnostics = self._build_scope_diagnostics(
-                seg_scope_all,
-                metric_col=metric_primary,
-                baseline_values=baseline_values,
-            )
-            diagnostics["reason"] = "No call-linked segments matched; deterministic carbon computation unavailable."
-            return self._no_data(
-                "No deterministic carbon rows matched the requested scope.",
-                boundary=boundary,
-                pollutants=pollutants_list,
-                result_state=CARBON_STATE_NOT_COMPUTABLE,
-                diagnostics=diagnostics,
-            )
+            daily_scope = _port_filter(self.daily_port.copy(), port_id)
+            daily_scope = _date_filter(daily_scope, "date", date_from, date_to)
+            if daily_scope.empty:
+                diagnostics = self._build_scope_diagnostics(
+                    seg_scope_all,
+                    metric_col=metric_primary,
+                    baseline_values=baseline_values,
+                )
+                diagnostics["reason"] = "No call-linked segments matched and no daily proxy rows matched."
+                return self._no_data(
+                    "No deterministic carbon rows matched the requested scope.",
+                    boundary=boundary,
+                    pollutants=pollutants_list,
+                    result_state=CARBON_STATE_NOT_COMPUTABLE,
+                    diagnostics=diagnostics,
+                )
+            deterministic = daily_scope.copy()
+            used_proxy_daily = True
 
-        table, chart = self._aggregate_port_scope_from_segments(
-            seg_scope=deterministic,
-            metric_cols=metric_cols,
-            group_by=group_by,
-            include_uncertainty=include_uncertainty,
-        )
+        if used_proxy_daily:
+            work = deterministic.copy()
+            work["date"] = pd.to_datetime(work["date"], errors="coerce", utc=True).dt.floor("D")
+            work = work.dropna(subset=["date"])
+            if group_by.lower() in {"month", "monthly"}:
+                work["bucket"] = work["date"].dt.to_period("M").astype(str)
+            else:
+                work["bucket"] = work["date"]
+
+            group_cols = ["bucket", "port_key", "port_label", "locode_norm"]
+            agg_map: Dict[str, str] = {m: "sum" for m in metric_cols if m in work.columns}
+            if "row_count" in work.columns:
+                agg_map["row_count"] = "sum"
+            if "segments" in work.columns:
+                agg_map["segments"] = "sum"
+            if "duration_h" in work.columns:
+                agg_map["duration_h"] = "sum"
+            if "fallback_usage_ratio" in work.columns:
+                agg_map["fallback_usage_ratio"] = "mean"
+            if "ci_width_rel" in work.columns:
+                agg_map["ci_width_rel"] = "mean"
+            if "confidence_reason" in work.columns:
+                agg_map["confidence_reason"] = "first"
+            if include_uncertainty:
+                for metric in metric_cols:
+                    low_col = f"{metric}_lower"
+                    up_col = f"{metric}_upper"
+                    if low_col in work.columns:
+                        agg_map[low_col] = "sum"
+                    if up_col in work.columns:
+                        agg_map[up_col] = "sum"
+
+            table = (
+                work.groupby(group_cols, dropna=False)
+                .agg(agg_map)
+                .reset_index()
+                .rename(columns={"bucket": "date"})
+                .sort_values("date")
+            )
+            chart = None
+            if metric_primary in table.columns:
+                chart = (
+                    table.groupby("date", dropna=False)[metric_primary]
+                    .sum()
+                    .reset_index()
+                    .set_index("date")
+                )
+        else:
+            table, chart = self._aggregate_port_scope_from_segments(
+                seg_scope=deterministic,
+                metric_cols=metric_cols,
+                group_by=group_by,
+                include_uncertainty=include_uncertainty,
+            )
         if table.empty:
             diagnostics = self._build_scope_diagnostics(
                 deterministic,
@@ -638,12 +715,15 @@ class CarbonQueryEngine:
         total_low = float(uncertainty.get(total_co2e_key, {}).get("lower", 0.0))
         total_up = float(uncertainty.get(total_co2e_key, {}).get("upper", 0.0))
         ci_width_rel = (total_up - total_low) / total_point if total_point > 0 else 0.0
-        fallback_ratio = float(pd.to_numeric(deterministic.get("fallback_usage_ratio"), errors="coerce").fillna(0.0).mean())
-        source_label = (
-            "Computed with fallback defaults"
-            if fallback_ratio > 0.15
-            else "Computed from AIS + port-call segmentation"
-        )
+        fallback_ratio = _mean_col(deterministic, "fallback_usage_ratio")
+        if used_proxy_daily:
+            source_label = "Computed from AIS-derived daily carbon inventory (proxy-based, no call-link in scope)"
+        else:
+            source_label = (
+                "Computed with fallback defaults"
+                if fallback_ratio > 0.15
+                else "Computed from AIS + port-call segmentation"
+            )
         conf = (
             "high"
             if ci_width_rel <= 0.20 and fallback_ratio <= 0.05
@@ -651,29 +731,41 @@ class CarbonQueryEngine:
             if ci_width_rel <= 0.40 or fallback_ratio <= 0.20
             else "low"
         )
+        if used_proxy_daily and conf == "high":
+            conf = "medium"
         conf_reason = (
             f"CI width={ci_width_rel:.2f}, fallback_ratio={fallback_ratio:.2f}, "
-            f"segments={len(deterministic):,}, group_by={group_by}."
+            f"rows={len(deterministic):,}, group_by={group_by}, mode={'daily_proxy' if used_proxy_daily else 'call_linked'}."
         )
         result_state = CARBON_STATE_COMPUTED_ZERO if abs(total_point) < 1e-12 else CARBON_STATE_COMPUTED
 
         diagnostics = self._build_scope_diagnostics(
-            deterministic,
+            seg_scope_all if used_proxy_daily else deterministic,
             metric_col=metric_primary,
             baseline_values=baseline_values,
         )
         diagnostics["result_state"] = result_state
+        diagnostics["deterministic_mode"] = "daily_proxy" if used_proxy_daily else "call_linked"
         diagnostics["reconciliation_total_tco2e"] = total_point
-        diagnostics["reconciliation_total_from_unique_calls_tco2e"] = _sum_col(
-            deterministic.groupby("call_id", dropna=False)[metric_primary].sum().reset_index(),
-            metric_primary,
-        )
-        diagnostics["reconciliation_unique_call_count"] = int(deterministic["call_id"].astype(str).nunique())
+        if used_proxy_daily:
+            diagnostics["reconciliation_total_from_unique_calls_tco2e"] = None
+            diagnostics["reconciliation_unique_call_count"] = int(
+                seg_scope_all["call_id"].fillna("").astype(str).replace("", pd.NA).dropna().nunique()
+            )
+        else:
+            diagnostics["reconciliation_total_from_unique_calls_tco2e"] = _sum_col(
+                deterministic.groupby("call_id", dropna=False)[metric_primary].sum().reset_index(),
+                metric_primary,
+            )
+            diagnostics["reconciliation_unique_call_count"] = int(
+                deterministic["call_id"].fillna("").astype(str).replace("", pd.NA).dropna().nunique()
+            )
 
         evidence_ids: List[str] = []
         segment_ids: List[str] = []
         if include_evidence and not self.evidence.empty:
-            seg_ids_all = set(deterministic["segment_id"].astype(str).tolist()) if "segment_id" in deterministic.columns else set()
+            seg_ids_source = seg_scope_all if used_proxy_daily else deterministic
+            seg_ids_all = set(seg_ids_source["segment_id"].astype(str).tolist()) if "segment_id" in seg_ids_source.columns else set()
             edf = _port_filter(self.evidence, port_id)
             edf = _date_filter(edf, "timestamp_start", date_from, date_to)
             if seg_ids_all and "segment_id" in edf.columns:
@@ -684,20 +776,39 @@ class CarbonQueryEngine:
                     segment_ids = edf["segment_id"].astype(str).head(50).tolist()
 
         port_label = port_id or "the selected scope"
-        answer = (
-            f"{boundary} emissions for {port_label} were computed from deterministic call-linked segmentation. "
-            f"Total {total_co2e_key}={total_point:.2f} tCO2e ({total_low:.2f}-{total_up:.2f} tCO2e)."
-        )
+        if used_proxy_daily:
+            answer = (
+                f"{boundary} emissions for {port_label} were computed from deterministic AIS-derived daily inventory "
+                f"(proxy-based, no call-link rows in this scope). "
+                f"Total {total_co2e_key}={total_point:.2f} tCO2e ({total_low:.2f}-{total_up:.2f} tCO2e)."
+            )
+        else:
+            answer = (
+                f"{boundary} emissions for {port_label} were computed from deterministic call-linked segmentation. "
+                f"Total {total_co2e_key}={total_point:.2f} tCO2e ({total_low:.2f}-{total_up:.2f} tCO2e)."
+            )
         coverage = [
-            f"Coverage segments: {len(deterministic):,}",
+            (
+                f"Coverage daily rows: {len(deterministic):,}"
+                if used_proxy_daily
+                else f"Coverage segments: {len(deterministic):,}"
+            ),
             f"Unique vessel-calls: {diagnostics.get('unique_vessel_calls', 0):,}",
             f"Boundary: {boundary}",
             f"Pollutants: {', '.join(pollutants_list)}",
             f"Group by: {group_by}",
             "Source label: " + source_label,
             f"Fallback usage ratio: {fallback_ratio:.2f}",
-            "Reconciliation: total displayed emissions equal the sum of unique call-linked emissions.",
-            "Reconciliation: intensity denominator uses unique vessel-call count.",
+            (
+                "Reconciliation: total displayed emissions equal the sum of unique call-linked emissions."
+                if not used_proxy_daily
+                else "Reconciliation: total displayed emissions equal the sum of deterministic daily proxy rows in scope."
+            ),
+            (
+                "Reconciliation: intensity denominator uses unique vessel-call count."
+                if not used_proxy_daily
+                else "Reconciliation: intensity denominator uses unique vessel-call count when call-link rows are available."
+            ),
             "Unit standard: absolute greenhouse-gas values are expressed in tCO2e.",
         ]
         caveats = [

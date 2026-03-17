@@ -6,6 +6,7 @@ from pathlib import Path
 import pandas as pd
 
 from src.carbon.query import (
+    CARBON_STATE_COMPUTED,
     CARBON_STATE_COMPUTED_ZERO,
     CARBON_STATE_FORECAST_ONLY,
     CARBON_STATE_NOT_COMPUTABLE,
@@ -34,7 +35,7 @@ def _write_minimal_carbon_artifacts(
 
 
 class CarbonQueryStateTests(unittest.TestCase):
-    def test_port_query_not_computable_when_no_call_linked_segments(self) -> None:
+    def test_port_query_uses_daily_proxy_when_no_call_linked_segments(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)
             segments = pd.DataFrame(
@@ -113,9 +114,10 @@ class CarbonQueryStateTests(unittest.TestCase):
                 boundary="TTW",
                 pollutants=["CO2e"],
             )
-            self.assertEqual(result.status, "no_data")
-            self.assertEqual(result.result_state, CARBON_STATE_NOT_COMPUTABLE)
-            self.assertIsNone(result.table)
+            self.assertEqual(result.status, "ok")
+            self.assertEqual(result.result_state, CARBON_STATE_COMPUTED)
+            self.assertIsNotNone(result.table)
+            self.assertIn("proxy", result.source_label.lower())
 
     def test_vessel_call_computed_zero_state(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

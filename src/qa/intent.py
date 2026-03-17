@@ -112,6 +112,19 @@ DESCRIPTIVE_KEYWORDS = (
 )
 
 PORT_TOKEN_STOPWORDS = {
+    "TTW",
+    "WTW",
+    "CO2",
+    "CO2E",
+    "NOX",
+    "SOX",
+    "PM",
+    "CARBON",
+    "EMISSION",
+    "EMISSIONS",
+    "POLLUTANT",
+    "POLLUTANTS",
+    "GHG",
     "AIS",
     "IMO",
     "MMSI",
@@ -136,6 +149,16 @@ PORT_TOKEN_STOPWORDS = {
     "CHANGES",
 }
 NON_PORT_CODE_TOKENS = {
+    "TTW",
+    "WTW",
+    "CO2",
+    "CO2E",
+    "NOX",
+    "SOX",
+    "PM",
+    "CARBON",
+    "EMISSION",
+    "EMISSIONS",
     "JANUARY",
     "FEBRUARY",
     "MARCH",
