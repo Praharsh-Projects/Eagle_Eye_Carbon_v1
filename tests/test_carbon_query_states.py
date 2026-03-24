@@ -407,6 +407,160 @@ class CarbonQueryStateTests(unittest.TestCase):
             self.assertIn(result.result_state, {CARBON_STATE_COMPUTED, CARBON_STATE_COMPUTED_ZERO})
             self.assertIsNotNone(result.table)
 
+    def test_call_id_parsing_and_resolution_accepts_call_id_underscore_form(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            call_id = "111111111_2022-03-05T10-00-00_SEGOT"
+            mmsi = "111111111"
+            segments = pd.DataFrame(
+                [
+                    {
+                        "segment_id": "seg-c",
+                        "mmsi": mmsi,
+                        "call_id": call_id,
+                        "port_key": "SEGOT",
+                        "port_label": "Gothenburg",
+                        "locode_norm": "SEGOT",
+                        "timestamp_start": pd.Timestamp("2022-03-05T10:00:00Z"),
+                        "timestamp_end": pd.Timestamp("2022-03-05T11:00:00Z"),
+                        "duration_h": 1.0,
+                        "row_count": 1,
+                        "ci_width_rel": 0.1,
+                        "fallback_usage_ratio": 0.0,
+                        "co2_t": 1.0,
+                        "ttw_co2e_t": 1.0,
+                        "wtt_co2e_t": 0.2,
+                        "wtw_co2e_t": 1.2,
+                        "nox_kg": 0.1,
+                        "sox_kg": 0.1,
+                        "pm_kg": 0.1,
+                    }
+                ]
+            )
+            calls = pd.DataFrame(
+                [
+                    {
+                        "call_id": call_id,
+                        "mmsi": mmsi,
+                        "port_key": "SEGOT",
+                        "port_label": "Gothenburg",
+                        "locode_norm": "SEGOT",
+                        "ci_width_rel": 0.1,
+                        "fallback_usage_ratio": 0.0,
+                        "ttw_co2e_t": 1.0,
+                        "wtt_co2e_t": 0.2,
+                        "wtw_co2e_t": 1.2,
+                        "co2_t": 1.0,
+                        "nox_kg": 0.1,
+                        "sox_kg": 0.1,
+                        "pm_kg": 0.1,
+                    }
+                ]
+            )
+            daily = pd.DataFrame(
+                [
+                    {
+                        "date": pd.Timestamp("2022-03-05T00:00:00Z"),
+                        "port_key": "SEGOT",
+                        "port_label": "Gothenburg",
+                        "locode_norm": "SEGOT",
+                        "ttw_co2e_t": 1.0,
+                        "wtw_co2e_t": 1.2,
+                    }
+                ]
+            )
+            evidence = pd.DataFrame(
+                [
+                    {
+                        "evidence_id": "ev-c",
+                        "segment_id": "seg-c",
+                        "mmsi": mmsi,
+                        "call_id": call_id,
+                        "port_key": "SEGOT",
+                        "timestamp_start": pd.Timestamp("2022-03-05T10:00:00Z"),
+                        "timestamp_end": pd.Timestamp("2022-03-05T11:00:00Z"),
+                        "row_count": 1,
+                    }
+                ]
+            )
+            _write_minimal_carbon_artifacts(root, segments, calls, daily, evidence)
+            engine = CarbonQueryEngine(processed_dir=root, auto_build=False)
+            result = engine.from_question_entities(
+                question=f"What are call-level emissions for MMSI {mmsi} and call_id_{call_id}?",
+                entities={
+                    "boundary": "WTW",
+                    "pollutants": ["CO2e"],
+                    "mmsi": mmsi,
+                    "call_id": f"_{call_id}",
+                },
+                user_filters={},
+            )
+            self.assertEqual(result.status, "ok")
+            self.assertIn(result.result_state, {CARBON_STATE_COMPUTED, CARBON_STATE_COMPUTED_ZERO})
+            self.assertEqual(result.diagnostics.get("call_id_matched"), call_id)
+
+    def test_call_id_missing_stays_not_computable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            segments = pd.DataFrame(
+                [
+                    {
+                        "segment_id": "seg-z",
+                        "mmsi": "999999999",
+                        "call_id": "999999999_2022-03-05T10-00-00_SEGOT",
+                        "port_key": "SEGOT",
+                        "port_label": "Gothenburg",
+                        "locode_norm": "SEGOT",
+                        "timestamp_start": pd.Timestamp("2022-03-05T10:00:00Z"),
+                        "timestamp_end": pd.Timestamp("2022-03-05T11:00:00Z"),
+                        "duration_h": 1.0,
+                        "row_count": 1,
+                        "ttw_co2e_t": 1.0,
+                        "wtw_co2e_t": 1.2,
+                    }
+                ]
+            )
+            calls = pd.DataFrame(
+                [
+                    {
+                        "call_id": "999999999_2022-03-05T10-00-00_SEGOT",
+                        "mmsi": "999999999",
+                        "port_key": "SEGOT",
+                        "port_label": "Gothenburg",
+                        "locode_norm": "SEGOT",
+                        "ttw_co2e_t": 1.0,
+                        "wtw_co2e_t": 1.2,
+                    }
+                ]
+            )
+            daily = pd.DataFrame(
+                [
+                    {
+                        "date": pd.Timestamp("2022-03-05T00:00:00Z"),
+                        "port_key": "SEGOT",
+                        "port_label": "Gothenburg",
+                        "locode_norm": "SEGOT",
+                        "ttw_co2e_t": 1.0,
+                        "wtw_co2e_t": 1.2,
+                    }
+                ]
+            )
+            evidence = pd.DataFrame(columns=["evidence_id", "segment_id", "mmsi", "call_id", "port_key"])
+            _write_minimal_carbon_artifacts(root, segments, calls, daily, evidence)
+            engine = CarbonQueryEngine(processed_dir=root, auto_build=False)
+            result = engine.from_question_entities(
+                question="What are call-level emissions for MMSI 111111111 and call_id_111111111_2022-01-01T00-00-00_SEGOT?",
+                entities={
+                    "boundary": "WTW",
+                    "pollutants": ["CO2e"],
+                    "mmsi": "111111111",
+                    "call_id": "_111111111_2022-01-01T00-00-00_SEGOT",
+                },
+                user_filters={},
+            )
+            self.assertEqual(result.status, "no_data")
+            self.assertEqual(result.result_state, CARBON_STATE_NOT_COMPUTABLE)
+
 
 if __name__ == "__main__":
     unittest.main()

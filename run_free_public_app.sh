@@ -9,12 +9,19 @@ TUNNEL_LOG="$(mktemp -t eagle-eye-tunnel.XXXX.log)"
 TUNNEL_PID=""
 TUNNEL_URL=""
 PREFERRED_TUNNEL="${PREFERRED_TUNNEL:-cloudflared}"
+RUN_MODE="docker"
+STREAMLIT_PID=""
+STREAMLIT_LOG="${ROOT_DIR}/.streamlit_local.log"
 
 cleanup() {
   local exit_code=$?
   if [[ -n "${TUNNEL_PID}" ]] && kill -0 "${TUNNEL_PID}" >/dev/null 2>&1; then
     kill "${TUNNEL_PID}" >/dev/null 2>&1 || true
     wait "${TUNNEL_PID}" >/dev/null 2>&1 || true
+  fi
+  if [[ -n "${STREAMLIT_PID}" ]] && kill -0 "${STREAMLIT_PID}" >/dev/null 2>&1; then
+    kill "${STREAMLIT_PID}" >/dev/null 2>&1 || true
+    wait "${STREAMLIT_PID}" >/dev/null 2>&1 || true
   fi
   docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
   rm -f "${TUNNEL_LOG}"
@@ -63,15 +70,27 @@ wait_for_local_streamlit() {
     if curl -fsS "${LOCAL_URL}/_stcore/health" >/dev/null 2>&1; then
       return 0
     fi
-    if ! docker ps --format '{{.Names}}' | grep -Fxq "${CONTAINER_NAME}"; then
-      printf 'Error: Streamlit container stopped unexpectedly.\n' >&2
-      docker logs --tail 200 "${CONTAINER_NAME}" >&2 || true
-      exit 1
+    if [[ "${RUN_MODE}" == "docker" ]]; then
+      if ! docker ps --format '{{.Names}}' | grep -Fxq "${CONTAINER_NAME}"; then
+        printf 'Error: Streamlit container stopped unexpectedly.\n' >&2
+        docker logs --tail 200 "${CONTAINER_NAME}" >&2 || true
+        exit 1
+      fi
+    else
+      if [[ -n "${STREAMLIT_PID}" ]] && ! kill -0 "${STREAMLIT_PID}" >/dev/null 2>&1; then
+        printf 'Error: local Streamlit process stopped unexpectedly.\n' >&2
+        tail -n 200 "${STREAMLIT_LOG}" >&2 || true
+        exit 1
+      fi
     fi
     sleep 2
   done
   printf 'Error: Streamlit did not become healthy at %s within timeout.\n' "${LOCAL_URL}" >&2
-  docker logs --tail 200 "${CONTAINER_NAME}" >&2 || true
+  if [[ "${RUN_MODE}" == "docker" ]]; then
+    docker logs --tail 200 "${CONTAINER_NAME}" >&2 || true
+  else
+    tail -n 200 "${STREAMLIT_LOG}" >&2 || true
+  fi
   exit 1
 }
 
@@ -166,11 +185,16 @@ start_tunnel() {
 }
 
 print_step "1/6" "Checking prerequisites"
-require_cmd docker "Install Docker Desktop and ensure it is running."
 require_cmd curl "curl is needed for health checks."
-if ! docker info >/dev/null 2>&1; then
-  printf 'Error: Docker is installed but the daemon is not reachable. Start Docker Desktop and retry.\n' >&2
-  exit 1
+if command -v docker >/dev/null 2>&1 && docker info >/dev/null 2>&1; then
+  RUN_MODE="docker"
+else
+  RUN_MODE="local_process"
+  printf 'Warning: Docker daemon is not reachable. Falling back to local Streamlit process mode.\n' >&2
+  if [[ ! -x "${ROOT_DIR}/.venv/bin/streamlit" ]]; then
+    printf 'Error: local fallback needs %s/.venv/bin/streamlit (venv not found).\n' "${ROOT_DIR}" >&2
+    exit 1
+  fi
 fi
 
 load_env_file
@@ -194,21 +218,30 @@ if lsof -nP -iTCP:8501 -sTCP:LISTEN >/dev/null 2>&1; then
 fi
 
 print_step "2/6" "Building local Streamlit image"
-docker build -t "${IMAGE_NAME}" -f "${ROOT_DIR}/Dockerfile" "${ROOT_DIR}" >/dev/null 2>&1
+if [[ "${RUN_MODE}" == "docker" ]]; then
+  docker build -t "${IMAGE_NAME}" -f "${ROOT_DIR}/Dockerfile" "${ROOT_DIR}" >/dev/null 2>&1
 
-print_step "3/6" "Starting Streamlit container with full local data"
-docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
-docker run -d \
-  --name "${CONTAINER_NAME}" \
-  -p 8501:8501 \
-  -e OPENAI_API_KEY="${OPENAI_API_KEY}" \
-  -e VECTOR_DB_MODE="local" \
-  -v "${ROOT_DIR}/app:/app/app:ro" \
-  -v "${ROOT_DIR}/src:/app/src:ro" \
-  -v "${ROOT_DIR}/config:/app/config:ro" \
-  -v "${ROOT_DIR}/data/processed:/app/data/processed:ro" \
-  -v "${ROOT_DIR}/data/chroma:/app/data/chroma" \
-  "${IMAGE_NAME}" >/dev/null
+  print_step "3/6" "Starting Streamlit container with full local data"
+  docker rm -f "${CONTAINER_NAME}" >/dev/null 2>&1 || true
+  docker run -d \
+    --name "${CONTAINER_NAME}" \
+    -p 8501:8501 \
+    -e OPENAI_API_KEY="${OPENAI_API_KEY}" \
+    -e VECTOR_DB_MODE="local" \
+    -v "${ROOT_DIR}/app:/app/app:ro" \
+    -v "${ROOT_DIR}/src:/app/src:ro" \
+    -v "${ROOT_DIR}/config:/app/config:ro" \
+    -v "${ROOT_DIR}/data/processed:/app/data/processed:ro" \
+    -v "${ROOT_DIR}/data/chroma:/app/data/chroma" \
+    "${IMAGE_NAME}" >/dev/null
+else
+  print_step "2/6" "Starting local Streamlit process with full local data"
+  rm -f "${STREAMLIT_LOG}" || true
+  PYTHONPATH="${ROOT_DIR}" "${ROOT_DIR}/.venv/bin/streamlit" run "${ROOT_DIR}/app/streamlit_app.py" \
+    --server.address 0.0.0.0 --server.port 8501 >"${STREAMLIT_LOG}" 2>&1 &
+  STREAMLIT_PID=$!
+  print_step "3/6" "Local Streamlit PID: ${STREAMLIT_PID}"
+fi
 
 print_step "4/6" "Waiting for Streamlit to become healthy"
 wait_for_local_streamlit
@@ -224,14 +257,26 @@ printf 'Public URL: %s\n' "${TUNNEL_URL}"
 if [[ "${TUNNEL_URL}" == *"trycloudflare.com"* ]]; then
   printf 'Note: trycloudflare.com URLs are random per run. Set NGROK_DOMAIN or CLOUDFLARE_TUNNEL_TOKEN+CLOUDFLARE_TUNNEL_HOSTNAME for a stable URL.\n'
 fi
-printf 'Reminder: this stays live only while this Mac, Docker, and the tunnel process remain running.\n'
+if [[ "${RUN_MODE}" == "docker" ]]; then
+  printf 'Reminder: this stays live only while this Mac, Docker, and the tunnel process remain running.\n'
+else
+  printf 'Reminder: this stays live only while this Mac, local Streamlit process, and the tunnel process remain running.\n'
+fi
 printf 'Press Ctrl+C to stop the public app and clean up.\n\n'
 
 while true; do
-  if ! docker ps --format '{{.Names}}' | grep -Fxq "${CONTAINER_NAME}"; then
-    printf 'Error: Streamlit container stopped unexpectedly.\n' >&2
-    docker logs --tail 200 "${CONTAINER_NAME}" >&2 || true
-    exit 1
+  if [[ "${RUN_MODE}" == "docker" ]]; then
+    if ! docker ps --format '{{.Names}}' | grep -Fxq "${CONTAINER_NAME}"; then
+      printf 'Error: Streamlit container stopped unexpectedly.\n' >&2
+      docker logs --tail 200 "${CONTAINER_NAME}" >&2 || true
+      exit 1
+    fi
+  else
+    if [[ -n "${STREAMLIT_PID}" ]] && ! kill -0 "${STREAMLIT_PID}" >/dev/null 2>&1; then
+      printf 'Error: local Streamlit process stopped unexpectedly.\n' >&2
+      tail -n 200 "${STREAMLIT_LOG}" >&2 || true
+      exit 1
+    fi
   fi
   if [[ -n "${TUNNEL_PID}" ]] && ! kill -0 "${TUNNEL_PID}" >/dev/null 2>&1; then
     printf 'Error: tunnel process stopped unexpectedly.\n' >&2

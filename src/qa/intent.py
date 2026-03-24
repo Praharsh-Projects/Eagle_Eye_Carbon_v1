@@ -25,12 +25,29 @@ UNSUPPORTED_KEYWORDS = (
     "crane",
     "berth utilization",
     "berth productivity",
+    "berth-level",
+    "berth level",
+    "berth queue",
     "teu",
+    "teu throughput",
     "throughput",
     "gate queue",
+    "queue length",
+    "turn-time",
+    "turn time",
+    "truck turn-time",
+    "truck turn time",
     "yard occupancy",
     "terminal gate",
     "container stack",
+)
+
+UNSUPPORTED_REGEX_PATTERNS = (
+    r"\bberth[\s-]*level\b",
+    r"\bturn[\s-]*time\b",
+    r"\bqueue[\s-]*length\b",
+    r"\bgate[\s-]*queue\b",
+    r"\bteu[\s-]*throughput\b",
 )
 
 ANOMALY_KEYWORDS = (
@@ -152,6 +169,12 @@ PORT_TOKEN_STOPWORDS = {
     "KNOT",
     "KNOTS",
     "MODE",
+    "DAILY",
+    "TREND",
+    "INDEX",
+    "LEVEL",
+    "ISTHE",
+    "MONTHLY",
     "FOR",
     "WITH",
 }
@@ -198,7 +221,7 @@ LAST_WEEKS_RE = re.compile(r"\blast\s+(\d{1,2})\s+weeks?\b", re.IGNORECASE)
 HORIZON_WEEKS_RE = re.compile(r"\b(\d{1,2})\s+weeks?\b", re.IGNORECASE)
 MMSI_RE = re.compile(r"\bmmsi\s*[:#]?\s*(\d{6,9})\b", re.IGNORECASE)
 IMO_RE = re.compile(r"\bimo\s*[:#]?\s*(\d{6,8})\b", re.IGNORECASE)
-CALL_ID_RE = re.compile(r"\bcall[_\-\s]?id\s*[:=]?\s*([A-Za-z0-9_\-:.]+)\b", re.IGNORECASE)
+CALL_ID_RE = re.compile(r"\bcall[_\-\s]?id[\s:=_\-]*([A-Za-z0-9_\-:.]+)\b", re.IGNORECASE)
 LONG_DATE_RE = re.compile(
     r"\b(?:on\s+)?(?:(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\s*,?\s*)?"
     r"(january|february|march|april|may|june|july|august|september|october|november|december)\s+"
@@ -209,6 +232,29 @@ RELATIVE_DOW_RE = re.compile(
     r"\b(next|this)\s+(monday|tuesday|wednesday|thursday|friday|saturday|sunday)\b",
     re.IGNORECASE,
 )
+
+BALTIC_LOCODE_PREFIXES = {"SE", "FI", "LV", "LT", "PL", "EE", "DK", "DE", "NO", "RU"}
+PORT_PHRASE_RE = re.compile(
+    r"\b(?:at|in|near|to|for|from)\s+([A-Za-z][A-Za-z\- ]{2,48})",
+    flags=re.IGNORECASE,
+)
+BETWEEN_PORTS_RE = re.compile(
+    r"\bbetween\s+([A-Za-z0-9\- ]{2,24})\s+and\s+([A-Za-z0-9\- ]{2,24})",
+    flags=re.IGNORECASE,
+)
+KNOWN_PORT_ALIASES = {
+    "gothenburg",
+    "goteborg",
+    "gdansk",
+    "gdynia",
+    "klaipeda",
+    "riga",
+    "kotka",
+    "swinoujscie",
+    "szczecin",
+    "lubeck",
+    "ventspils",
+}
 
 
 @dataclass
@@ -299,79 +345,123 @@ def _extract_carbon_pollutants(question: str) -> List[str]:
     return out
 
 
+def _is_locode_like(token: str) -> bool:
+    t = (token or "").upper().replace(" ", "")
+    if not re.fullmatch(r"[A-Z]{5}", t):
+        return False
+    if t in NON_PORT_CODE_TOKENS or t in PORT_TOKEN_STOPWORDS:
+        return False
+    return t[:2] in BALTIC_LOCODE_PREFIXES
+
+
+def _clean_port_phrase(raw: str) -> str:
+    text = (raw or "").strip(" ,.;:()[]")
+    if not text:
+        return ""
+    text = re.split(
+        r"\b(?:between|from|on|during|next|last|this|for|with|where|when|which|in)\b",
+        text,
+        maxsplit=1,
+        flags=re.IGNORECASE,
+    )[0].strip(" ,.;:")
+    return text
+
+
+def _looks_like_port_name(value: str) -> bool:
+    if not value:
+        return False
+    low = value.lower().strip()
+    if not low or low in {"port", "index", "level", "daily", "trend", "monthly"}:
+        return False
+    if low in KNOWN_PORT_ALIASES:
+        return True
+    words = [w for w in re.split(r"\s+", low) if w]
+    if not words:
+        return False
+    if any(ch.isdigit() for ch in low):
+        return False
+    bad_tokens = {
+        "mmsi",
+        "imo",
+        "call",
+        "call_id",
+        "id",
+        "the",
+        "gate",
+        "queue",
+        "length",
+        "turn",
+        "time",
+        "vessel",
+        "ship",
+        "tanker",
+        "cargo",
+        "container",
+        "hours",
+        "hour",
+        "knots",
+        "knot",
+        "mode",
+        "emissions",
+        "emission",
+        "co2",
+        "co2e",
+        "nox",
+        "sox",
+        "pm",
+    }
+    if any(tok in bad_tokens for tok in words):
+        return False
+    if len("".join(words)) < 4:
+        return False
+    return True
+
+
 def _extract_ports(question: str) -> List[str]:
     ports: List[str] = []
     upper = question.upper()
 
     for c1, c2 in LOCODE_RE.findall(upper):
         locode = f"{c1}{c2}"
-        if locode in NON_PORT_CODE_TOKENS:
-            continue
-        if locode not in PORT_TOKEN_STOPWORDS:
+        if _is_locode_like(locode):
             ports.append(locode)
 
-    upper_tokens = re.findall(r"\b[A-Z]{4,}\b", question)
-    for token in upper_tokens:
-        if token in PORT_TOKEN_STOPWORDS:
+    word_tokens = re.findall(r"\b[A-Za-z]{4,}\b", question)
+    for raw in word_tokens:
+        token = raw.upper()
+        if token in PORT_TOKEN_STOPWORDS or token in NON_PORT_CODE_TOKENS:
             continue
-        if token in {"SHOW", "FIND", "BETWEEN", "DURING", "WEEKS", "FRIDAY", "MONDAY"}:
+        if _is_locode_like(token):
+            if token not in ports:
+                ports.append(token)
             continue
-        if token.isdigit():
-            continue
-        # Keep likely destination/port identifiers like LUBECK, GDANSK, RIGA.
-        if token not in ports:
-            ports.append(token)
+        if raw.lower() in KNOWN_PORT_ALIASES and raw not in ports:
+            ports.append(raw)
 
-    # Phrase-based fallback for mixed-case names.
-    phrase_hits = re.findall(
-        r"\b(?:at|near|in|to)\s+([A-Za-z][A-Za-z\- ]{2,40})",
-        question,
-        flags=re.IGNORECASE,
-    )
-    for phrase in phrase_hits:
-        cleaned = re.split(
-            r"\b(?:between|from|on|during|next|last|this|in)\b",
-            phrase,
-            maxsplit=1,
-            flags=re.IGNORECASE,
-        )[0]
-        cleaned = cleaned.strip(" ,.;:")
+    for phrase in PORT_PHRASE_RE.findall(question):
+        cleaned = _clean_port_phrase(phrase)
         if not cleaned:
             continue
-        cleaned_low = cleaned.lower()
-        if cleaned_low.startswith("a ") and any(
-            token in cleaned_low for token in ("tanker", "cargo", "container", "vessel", "ship")
-        ):
+        cleaned_code = cleaned.upper().replace(" ", "")
+        if _is_locode_like(cleaned_code):
+            if cleaned_code not in ports:
+                ports.append(cleaned_code)
             continue
-        if any(
-            token in cleaned_low
-            for token in (
-                " mode",
-                "hours",
-                "hour",
-                "knots",
-                "knot",
-                "vessel",
-                "ship",
-                "tanker",
-                "cargo",
-                "container",
-            )
-        ):
-            continue
-        if cleaned.upper() in PORT_TOKEN_STOPWORDS:
-            continue
-        if cleaned.upper() not in ports:
+        if _looks_like_port_name(cleaned) and cleaned not in ports:
             ports.append(cleaned)
 
-    in_caps_hits = re.findall(r"\bin\s+([A-Z]{4,})\b", question)
-    for token in in_caps_hits:
-        if token in PORT_TOKEN_STOPWORDS:
-            continue
-        if token not in ports:
-            ports.append(token)
+    for a_raw, b_raw in BETWEEN_PORTS_RE.findall(question):
+        for item in (_clean_port_phrase(a_raw), _clean_port_phrase(b_raw)):
+            if not item:
+                continue
+            item_code = item.upper().replace(" ", "")
+            if _is_locode_like(item_code):
+                if item_code not in ports:
+                    ports.append(item_code)
+                continue
+            if _looks_like_port_name(item) and item not in ports:
+                ports.append(item)
 
-    # Keep first two/three most likely candidates to avoid noise.
     deduped: List[str] = []
     for port in ports:
         if port not in deduped:
@@ -462,6 +552,28 @@ def _extract_target_date(question: str) -> Optional[str]:
     return None
 
 
+def _normalize_call_id(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    normalized = re.sub(r"^[\s:_\-]+", "", raw)
+    return normalized.strip()
+
+
+def _unsupported_hits(question: str) -> List[str]:
+    q = question.lower()
+    hits: List[str] = []
+    for token in UNSUPPORTED_KEYWORDS:
+        if token in q and token not in hits:
+            hits.append(token)
+    for pattern in UNSUPPORTED_REGEX_PATTERNS:
+        if re.search(pattern, q):
+            label = pattern.replace(r"\b", "").replace(r"[\s-]*", "-").strip("()")
+            if label not in hits:
+                hits.append(label)
+    return hits
+
+
 def classify_question(question: str) -> IntentResult:
     q = question.lower()
 
@@ -503,9 +615,21 @@ def classify_question(question: str) -> IntentResult:
         entities["imo"] = imo_hit.group(1)
     call_hit = CALL_ID_RE.search(question)
     if call_hit:
-        entities["call_id"] = call_hit.group(1)
+        entities["call_id"] = _normalize_call_id(call_hit.group(1))
 
-    if any(token in q for token in UNSUPPORTED_KEYWORDS):
+    extraction_diag = {
+        "ports_parsed": list(entities.get("ports") or []),
+        "port_selected": entities.get("port"),
+        "call_id_parsed": entities.get("call_id"),
+        "date_from": entities.get("date_from"),
+        "date_to": entities.get("date_to"),
+        "target_date": entities.get("target_date"),
+    }
+    entities["extraction_diagnostics"] = extraction_diag
+
+    unsupported_hits = _unsupported_hits(question)
+    if unsupported_hits:
+        extraction_diag["unsupported_hits"] = unsupported_hits
         return IntentResult(
             intent="G",
             entities=entities,
@@ -524,6 +648,14 @@ def classify_question(question: str) -> IntentResult:
 
     if any(token in q for token in FORECAST_KEYWORDS):
         return IntentResult(intent="C", entities=entities, reason="Forecasting language detected.")
+
+    if any(token in q for token in COMPARE_KEYWORDS):
+        if entities.get("dow") or entities.get("dow_compare"):
+            return IntentResult(
+                intent="B",
+                entities=entities,
+                reason="Temporal weekday comparison detected.",
+            )
 
     if any(token in q for token in COMPARE_KEYWORDS):
         return IntentResult(intent="D", entities=entities, reason="Comparative phrasing detected.")

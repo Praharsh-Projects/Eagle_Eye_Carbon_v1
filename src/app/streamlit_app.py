@@ -68,7 +68,7 @@ SAMPLE_QUERIES_BY_CATEGORY: Dict[str, List[str]] = {
         "Show cargo-ship arrivals at GDANSK during 2022-03.",
     ],
     "Vessel Investigation": [
-        "For MMSI 266232000, how long was the vessel in port on 2021-03-01?",
+        "For MMSI 245286000, how long was the vessel in port on 2021-01-01?",
         "Show suspicious AIS jumps for MMSI 246521000 on 2022-03-10.",
         "For MMSI 212575000, summarize suspicious AIS jumps on 2021-01-01.",
         "List any AIS jump anomalies for MMSI 266232000 between 2021-01-01 and 2021-01-03.",
@@ -95,7 +95,7 @@ SAMPLE_QUERIES_BY_CATEGORY: Dict[str, List[str]] = {
         "Carbon emissions for SEGOT by month in 2022.",
         "Report TTW CO2e and NOx at LVVNT for 2022-03 grouped by day.",
         "Show WTW CO2e at SEGVX between 2022-03-01 and 2022-03-31.",
-        "What are call-level emissions for MMSI 255806385 and call_id 255806385_2021-03-02T05-15-06_LTKLJ?",
+        "What are call-level emissions for MMSI 209468000 and call_id 209468000_2021-01-06T10-17-56_SETRG?",
         "Estimate carbon emissions for a tanker in manoeuvring mode for 2 hours at 6 knots.",
         "Compare TTW versus WTW CO2e totals at SETRG for March 2022.",
         "Show monthly WTW CO2e trend for SETRG in 2022.",
@@ -126,6 +126,27 @@ PORT_ALIAS_TO_CODE: Dict[str, str] = {
     "sodertalje": "SESOE",
 }
 
+PORT_PARSE_STOPWORDS = {
+    "DAILY",
+    "TREND",
+    "INDEX",
+    "LEVEL",
+    "ISTHE",
+    "MONTHLY",
+    "WEEKLY",
+    "CARBON",
+    "EMISSIONS",
+    "EMISSION",
+    "CONGESTION",
+    "FORECAST",
+    "PREDICT",
+    "EXPECTED",
+    "SHOW",
+    "WHAT",
+    "WHICH",
+}
+BALTIC_LOCODE_PREFIXES = {"SE", "FI", "LV", "LT", "PL", "EE", "DK", "DE", "NO", "RU"}
+
 
 @dataclass
 class EvidenceBundle:
@@ -152,6 +173,36 @@ def _init_carbon_engine(processed_dir: str, factor_registry_path: str, monte_car
         monte_carlo_draws=monte_carlo_draws,
         auto_build=True,
     )
+
+
+def _validate_sample_queries_runtime(carbon_engine: Optional[CarbonQueryEngine]) -> None:
+    if carbon_engine is None:
+        return
+    if carbon_engine.calls is None or carbon_engine.calls.empty:
+        print("[sample-validation] carbon_emissions_call.parquet is empty; call-level sample queries may no_data.")
+        return
+
+    calls = carbon_engine.calls.copy()
+    calls["mmsi"] = calls.get("mmsi", "").fillna("").astype(str)
+    calls["call_id"] = calls.get("call_id", "").fillna("").astype(str)
+
+    for category, samples in SAMPLE_QUERIES_BY_CATEGORY.items():
+        for sample in samples:
+            if "call-level emissions" not in sample.lower():
+                continue
+            mmsi_hit = re.search(r"\bmmsi\s+(\d{6,9})\b", sample, flags=re.IGNORECASE)
+            call_hit = re.search(r"\bcall[_\-\s]?id[\s:=_\-]*([A-Za-z0-9_\-:.]+)\b", sample, flags=re.IGNORECASE)
+            if not mmsi_hit or not call_hit:
+                print(f"[sample-validation] {category}: call-level sample could not be parsed -> {sample}")
+                continue
+            mmsi = mmsi_hit.group(1).strip()
+            call_id = re.sub(r"^[\s:_\-]+", "", call_hit.group(1).strip())
+            matched = calls[(calls["mmsi"] == mmsi) & (calls["call_id"] == call_id)]
+            if matched.empty:
+                print(
+                    "[sample-validation] "
+                    f"{category}: missing call-level sample data for mmsi={mmsi}, call_id={call_id}."
+                )
 
 
 @st.cache_resource
@@ -403,6 +454,109 @@ def _resolve_ports(port_tokens: List[str], kpi: KPIQueryEngine) -> List[str]:
         if mapped not in resolved:
             resolved.append(mapped)
     return resolved
+
+
+def _is_known_port_token(port_token: Optional[str], kpi: KPIQueryEngine) -> bool:
+    token = (port_token or "").strip()
+    if not token:
+        return False
+    code = token.upper().replace(" ", "")
+    catalog = kpi.port_catalog
+    if catalog.empty:
+        return bool(re.fullmatch(r"[A-Z]{5}", code))
+
+    work = catalog.copy()
+    for col in ("port_key", "locode_norm"):
+        if col not in work.columns:
+            work[col] = ""
+        work[col] = work[col].fillna("").astype(str).str.upper().str.replace(r"[^A-Z0-9]", "", regex=True)
+
+    mask = (work["port_key"] == code) | (work["locode_norm"] == code)
+    return bool(mask.any())
+
+
+def _extract_port_tokens_from_question(question: str) -> List[str]:
+    candidates: List[str] = []
+    for m in re.finditer(r"\b([A-Za-z]{2})\s*([A-Za-z]{3})\b", question):
+        token = f"{m.group(1)}{m.group(2)}".upper()
+        if token[:2] in BALTIC_LOCODE_PREFIXES and token not in PORT_PARSE_STOPWORDS and token not in candidates:
+            candidates.append(token)
+
+    for alias in PORT_ALIAS_TO_CODE.keys():
+        if alias in _normalize_text_token(question):
+            if alias not in candidates:
+                candidates.append(alias)
+
+    return candidates[:8]
+
+
+def _resolve_scope_with_aggressive_port_fallback(
+    question: str,
+    entities: Dict[str, Any],
+    user_filters: Dict[str, Any],
+    kpi: KPIQueryEngine,
+) -> Dict[str, Any]:
+    raw_port = _pick_filter(user_filters.get("port"), entities.get("port"))
+    start = _pick_filter(user_filters.get("date_from"), entities.get("date_from"))
+    end = _pick_filter(user_filters.get("date_to"), entities.get("date_to"))
+
+    ranked_inputs: List[Tuple[str, str]] = []
+    raw_user_port = str(user_filters.get("port") or "").strip()
+    raw_entity_port = str(entities.get("port") or "").strip()
+    for source, token in (
+        [("user_filter", user_filters.get("port")), ("entity_primary", entities.get("port"))]
+        + [("entity_port", item) for item in list(entities.get("ports") or [])]
+        + [("question_scan", item) for item in _extract_port_tokens_from_question(question)]
+    ):
+        t = str(token or "").strip()
+        if t and all(existing[1] != t for existing in ranked_inputs):
+            ranked_inputs.append((source, t))
+
+    resolved_candidates: List[Dict[str, Any]] = []
+    for source, token in ranked_inputs:
+        mapped = _resolve_port_token(token, kpi)
+        valid = _is_known_port_token(mapped, kpi)
+        resolved_candidates.append(
+            {
+                "source": source,
+                "token": token,
+                "resolved": mapped,
+                "valid": valid,
+            }
+        )
+
+    resolved_port = None
+    for item in resolved_candidates:
+        if item["valid"]:
+            resolved_port = str(item["resolved"]).strip()
+            break
+    if resolved_port is None:
+        if raw_user_port:
+            resolved_port = _resolve_port_token(raw_user_port, kpi) or raw_user_port
+        else:
+            resolved_port = None
+
+    correction_applied = bool(raw_port and resolved_port and str(raw_port).strip() != resolved_port)
+    correction_note = None
+    if correction_applied:
+        correction_note = (
+            f"Resolved scope correction: port token `{raw_port}` was mapped to `{resolved_port}` "
+            "using aggressive candidate fallback."
+        )
+    elif raw_entity_port and not raw_user_port and resolved_port is None:
+        correction_note = (
+            f"Resolved scope correction: ignored ambiguous parsed port token `{raw_entity_port}` because no valid catalog match was found."
+        )
+
+    return {
+        "raw_port": raw_port,
+        "port": resolved_port,
+        "date_from": start,
+        "date_to": end,
+        "resolved_candidates": resolved_candidates,
+        "correction_applied": correction_applied,
+        "correction_note": correction_note,
+    }
 
 
 def _derive_answer_source(
@@ -723,13 +877,19 @@ def _handle_ask_question(
     user_filters: Dict[str, Any],
     events_path: Optional[Path],
 ) -> tuple[Union[AnalyticsResult, ForecastResult, CarbonResult], EvidenceBundle]:
-    entities = intent_result.entities
+    entities = dict(intent_result.entities or {})
     q_lower = question.lower()
 
-    raw_port = _pick_filter(user_filters.get("port"), entities.get("port"))
-    port = _resolve_port_token(raw_port, kpi)
-    start = _pick_filter(user_filters.get("date_from"), entities.get("date_from"))
-    end = _pick_filter(user_filters.get("date_to"), entities.get("date_to"))
+    scope = _resolve_scope_with_aggressive_port_fallback(
+        question=question,
+        entities=entities,
+        user_filters=user_filters,
+        kpi=kpi,
+    )
+    raw_port = scope.get("raw_port")
+    port = scope.get("port")
+    start = scope.get("date_from")
+    end = scope.get("date_to")
     vessel_type = _pick_filter(user_filters.get("vessel_type"), entities.get("vessel_type"))
     dow = entities.get("dow")
     target_date = entities.get("target_date")
@@ -742,7 +902,28 @@ def _handle_ask_question(
     ports: List[str] = [str(p).strip() for p in entities.get("ports") or [] if str(p).strip()]
     if port and port not in ports:
         ports.insert(0, port)
+    for cand in scope.get("resolved_candidates", []):
+        if not cand.get("valid"):
+            continue
+        resolved = str(cand.get("resolved") or "").strip()
+        if resolved and resolved not in ports:
+            ports.append(resolved)
     ports = _resolve_ports(ports, kpi)
+    entities["ports"] = ports
+    entities["port"] = port
+    entities["date_from"] = start
+    entities["date_to"] = end
+    extraction_diag = dict(entities.get("extraction_diagnostics") or {})
+    extraction_diag["resolved_scope"] = {
+        "raw_port": raw_port,
+        "resolved_port": port,
+        "date_from": start,
+        "date_to": end,
+        "correction_applied": bool(scope.get("correction_applied")),
+        "candidates": scope.get("resolved_candidates", []),
+    }
+    entities["extraction_diagnostics"] = extraction_diag
+    intent_result.entities = entities
 
     if start and end:
         start_ts = pd.to_datetime(start, errors="coerce", utc=True)
@@ -756,6 +937,10 @@ def _handle_ask_question(
     evidence_overrides = dict(user_filters)
     if port:
         evidence_overrides["port"] = port
+    if start:
+        evidence_overrides["date_from"] = start
+    if end:
+        evidence_overrides["date_to"] = end
 
     if intent_result.intent == "G":
         return (
@@ -766,7 +951,30 @@ def _handle_ask_question(
         )
 
     if intent_result.intent == "H":
-        result = carbon.from_question_entities(question=question, entities=entities, user_filters=user_filters)
+        carbon_filters = dict(user_filters)
+        if port:
+            carbon_filters["port"] = port
+        if start:
+            carbon_filters["date_from"] = start
+        if end:
+            carbon_filters["date_to"] = end
+        try:
+            result = carbon.from_question_entities(
+                question=question,
+                entities=entities,
+                user_filters=carbon_filters,
+                resolved_scope={"port": port, "date_from": start, "date_to": end},
+            )
+        except TypeError as exc:
+            # Backward-compatible fallback if an older runtime/module copy
+            # does not yet accept `resolved_scope`.
+            if "resolved_scope" not in str(exc):
+                raise
+            result = carbon.from_question_entities(
+                question=question,
+                entities=entities,
+                user_filters=carbon_filters,
+            )
         evidence = _retrieve_evidence(
             retriever=retriever,
             question=question,
@@ -791,6 +999,10 @@ def _handle_ask_question(
                 result.diagnostics["sanity_status"] = result.diagnostics.get("sanity_status", "warning")
             elif result.status == "ok" and evidence.rows and result.result_state in {CARBON_STATE_COMPUTED, CARBON_STATE_COMPUTED_ZERO}:
                 result.source_label = "Hybrid (computed + retrieved supporting evidence)"
+            if scope.get("correction_note"):
+                result.coverage_notes.append(str(scope["correction_note"]))
+                result.diagnostics = dict(result.diagnostics or {})
+                result.diagnostics["scope_correction_note"] = str(scope["correction_note"])
         return result, evidence
 
     if intent_result.intent == "A":
@@ -820,6 +1032,8 @@ def _handle_ask_question(
             top_k=top_k_evidence,
             include_dates=True,
         )
+        if scope.get("correction_note"):
+            result.coverage_notes.append(str(scope["correction_note"]))
         return result, evidence
 
     if intent_result.intent == "B":
@@ -853,6 +1067,8 @@ def _handle_ask_question(
             top_k=top_k_evidence,
             include_dates=True,
         )
+        if scope.get("correction_note"):
+            result.coverage_notes.append(str(scope["correction_note"]))
         return result, evidence
 
     if intent_result.intent == "C":
@@ -872,6 +1088,8 @@ def _handle_ask_question(
                 top_k=top_k_evidence,
                 include_dates=False,
             )
+            if scope.get("correction_note"):
+                result.coverage_notes.append(str(scope["correction_note"]))
             return result, evidence
 
         if target_date:
@@ -895,6 +1113,8 @@ def _handle_ask_question(
             top_k=top_k_evidence,
             include_dates=False,
         )
+        if scope.get("correction_note"):
+            result.coverage_notes.append(str(scope["correction_note"]))
         return result, evidence
 
     if intent_result.intent == "D":
@@ -914,6 +1134,8 @@ def _handle_ask_question(
             top_k=top_k_evidence,
             include_dates=True,
         )
+        if scope.get("correction_note"):
+            result.coverage_notes.append(str(scope["correction_note"]))
         return result, evidence
 
     if intent_result.intent == "E":
@@ -931,6 +1153,8 @@ def _handle_ask_question(
             top_k=top_k_evidence,
             include_dates=True,
         )
+        if scope.get("correction_note"):
+            result.coverage_notes.append(str(scope["correction_note"]))
         return result, evidence
 
     if intent_result.intent == "F":
@@ -1052,6 +1276,8 @@ def _handle_ask_question(
         top_k=top_k_evidence,
         include_dates=True,
     )
+    if scope.get("correction_note"):
+        result.coverage_notes.append(str(scope["correction_note"]))
     return result, evidence
 
 
@@ -1059,6 +1285,7 @@ def _render_compact_result(
     result: Union[AnalyticsResult, ForecastResult, CarbonResult],
     evidence: EvidenceBundle,
     show_technical: bool,
+    intent_result: Optional[IntentResult] = None,
     carbon_engine: Optional[CarbonQueryEngine] = None,
     threshold_percentiles: Tuple[float, float, float] = (0.25, 0.50, 0.75),
 ) -> None:
@@ -1394,6 +1621,7 @@ def _render_compact_result(
                     or note.startswith("Forecast target weekday:")
                     or note.startswith("Analog dates used:")
                     or note.startswith("Analog values used:")
+                    or note.startswith("Resolved scope correction:")
                     or note.startswith("Meaning:")
                 ):
                     steps.append(note)
@@ -1404,7 +1632,12 @@ def _render_compact_result(
         else:
             steps.append("Applied active filters (port/date/vessel-type/anomaly) to KPI tables.")
             for note in value.coverage_notes:
-                if note.startswith("Coverage window:") or note.startswith("Rows used:") or note.startswith("Data sources used:"):
+                if (
+                    note.startswith("Coverage window:")
+                    or note.startswith("Rows used:")
+                    or note.startswith("Data sources used:")
+                    or note.startswith("Resolved scope correction:")
+                ):
                     steps.append(note)
             if value.table is not None and not value.table.empty:
                 steps.append(f"Aggregated filtered rows into {len(value.table):,} output row(s) using deterministic pandas operations.")
@@ -2018,6 +2251,16 @@ def _render_compact_result(
         if where_used not in (None, "", {}):
             st.write(f"Where filter: `{where_used}`")
     if show_technical:
+        if intent_result is not None:
+            st.markdown("**Intent extraction diagnostics**")
+            st.json(
+                {
+                    "intent": intent_result.intent,
+                    "reason": intent_result.reason,
+                    "entities": intent_result.entities,
+                    "extraction_diagnostics": (intent_result.entities or {}).get("extraction_diagnostics", {}),
+                }
+            )
         if isinstance(result, CarbonResult):
             st.markdown("**Carbon technical audit**")
             st.write(
@@ -2146,23 +2389,31 @@ def main() -> None:
             factor_registry_path=str(carbon_cfg.get("factor_registry_path", "config/carbon_factors.v1.json")),
             monte_carlo_draws=int(carbon_cfg.get("monte_carlo_draws", 500)),
         )
+        _validate_sample_queries_runtime(carbon_engine)
     except Exception as exc:
         st.error(f"Could not initialize data engines: {exc}")
         st.info("Run `./run_demo_pipeline.sh` first.")
         st.stop()
 
     retriever: Optional[RAGRetriever] = None
-    retriever_reason = ""
+    retriever_reason = str(st.session_state.get("retriever_reason", "")).strip()
     api_key, key_source = _load_openai_api_key_from_runtime()
-    if api_key:
+    if not api_key:
+        retriever_reason = "Retriever unavailable: `OPENAI_API_KEY` not found in environment or Streamlit secrets."
+        with st.sidebar:
+            st.warning("Set `OPENAI_API_KEY` in app secrets to enable vector retrieval evidence.")
+    elif not retriever_reason:
+        retriever_reason = "Retriever will initialize on first Ask to keep page load fast."
+
+    def _ensure_retriever() -> tuple[Optional[RAGRetriever], str]:
+        nonlocal persist_dir, using_demo_chroma, chroma_bootstrap_changed, chroma_bootstrap_message
+        if not api_key:
+            return None, "Retriever unavailable: `OPENAI_API_KEY` not found in environment or Streamlit secrets."
         try:
-            retriever = _init_retriever(persist_dir=str(persist_dir), config_path=config_path)
-            retriever_reason = (
-                f"Retriever active (API key source: {key_source}, backend: {retriever.vector_backend})."
-            )
+            active = _init_retriever(persist_dir=str(persist_dir), config_path=config_path)
+            return active, f"Retriever active (API key source: {key_source}, backend: {active.vector_backend})."
         except Exception as exc:
-            retriever = None
-            retriever_reason = f"Retriever init failed: {exc}"
+            reason = f"Retriever init failed: {exc}"
             if using_remote_vector:
                 chroma_bootstrap_changed, chroma_bootstrap_message = _maybe_bootstrap_chroma_bundle(
                     configured_persist_dir
@@ -2170,27 +2421,21 @@ def main() -> None:
                 fallback_persist_dir, fallback_using_demo_chroma = _resolve_persist_dir(configured_persist_dir)
                 if (fallback_persist_dir / "chroma.sqlite3").exists():
                     try:
-                        retriever = _init_retriever(
+                        active = _init_retriever(
                             persist_dir=str(fallback_persist_dir),
                             config_path=config_path,
                             force_local_vector=True,
                         )
                         persist_dir = fallback_persist_dir
                         using_demo_chroma = fallback_using_demo_chroma
-                        retriever_reason = (
+                        return active, (
                             f"Remote retriever failed ({exc}). "
                             f"Fell back to local vector store at {fallback_persist_dir} "
-                            f"(backend: {retriever.vector_backend})."
+                            f"(backend: {active.vector_backend})."
                         )
                     except Exception as local_exc:
-                        retriever = None
-                        retriever_reason = (
-                            f"Remote retriever failed ({exc}); local fallback failed ({local_exc})."
-                        )
-    else:
-        retriever_reason = "Retriever unavailable: `OPENAI_API_KEY` not found in environment or Streamlit secrets."
-        with st.sidebar:
-            st.warning("Set `OPENAI_API_KEY` in app secrets to enable vector retrieval evidence.")
+                        reason = f"Remote retriever failed ({exc}); local fallback failed ({local_exc})."
+            return None, reason
 
     with st.sidebar:
         if "Fell back to local vector store" in retriever_reason:
@@ -2262,6 +2507,10 @@ def main() -> None:
     if not ask:
         return
 
+    with st.spinner("Preparing retrieval stack..."):
+        retriever, retriever_reason = _ensure_retriever()
+    st.session_state["retriever_reason"] = retriever_reason
+
     question = st.session_state.get("ask_question", "").strip()
     if not question:
         st.warning("Enter a question first.")
@@ -2293,6 +2542,7 @@ def main() -> None:
         result=result,
         evidence=evidence,
         show_technical=show_technical,
+        intent_result=intent_result,
         carbon_engine=carbon_engine,
         threshold_percentiles=threshold_percentiles,
     )

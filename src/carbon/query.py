@@ -74,6 +74,20 @@ _MCR_RE = re.compile(r"\b(\d+(?:\.\d+)?)\s*(?:kw|kW)\b")
 _REF_SPEED_RE = re.compile(r"\bref(?:erence)?\s*speed\s*(\d+(?:\.\d+)?)\s*(?:knots?|kn)\b", flags=re.IGNORECASE)
 
 
+def _normalize_call_id(value: str) -> str:
+    raw = (value or "").strip()
+    if not raw:
+        return ""
+    return re.sub(r"^[\s:_\-]+", "", raw).strip()
+
+
+def _canonical_call_id(value: str) -> str:
+    normalized = _normalize_call_id(value)
+    if not normalized:
+        return ""
+    return re.sub(r"[^A-Z0-9]", "", normalized.upper())
+
+
 def _extract_estimate_payload(question: str, entities: Dict[str, Any]) -> Optional[Dict[str, Any]]:
     q = (question or "").lower()
     is_estimate_query = any(token in q for token in ("estimate", "assum", "scenario"))
@@ -953,6 +967,9 @@ class CarbonQueryEngine:
     ) -> CarbonResult:
         boundary = _norm_boundary(boundary)
         pollutants_list = _norm_pollutants(pollutants)
+        target_mmsi = str(mmsi).strip()
+        target_call_id = _normalize_call_id(call_id)
+        target_call_canon = _canonical_call_id(target_call_id)
         if not self.available:
             return self._no_data(
                 "Carbon outputs are not available.",
@@ -971,7 +988,34 @@ class CarbonQueryEngine:
             )
         calls["mmsi"] = calls["mmsi"].fillna("").astype(str)
         calls["call_id"] = calls["call_id"].fillna("").astype(str)
-        work = calls[(calls["mmsi"] == str(mmsi)) & (calls["call_id"] == str(call_id))]
+        calls["call_id_norm"] = calls["call_id"].map(_normalize_call_id)
+        calls["call_id_canon"] = calls["call_id_norm"].map(_canonical_call_id)
+        mmsi_scope = calls[calls["mmsi"] == target_mmsi]
+        exact = mmsi_scope[mmsi_scope["call_id_norm"] == target_call_id]
+        if not exact.empty:
+            work = exact.copy()
+        else:
+            canon_matches = mmsi_scope[mmsi_scope["call_id_canon"] == target_call_canon].copy()
+            if canon_matches.empty:
+                work = pd.DataFrame()
+            else:
+                unique_norm = canon_matches["call_id_norm"].dropna().astype(str).unique().tolist()
+                if len(unique_norm) > 1:
+                    return self._no_data(
+                        "Ambiguous call_id match after normalization; provide full call_id as stored in carbon_emissions_call.",
+                        boundary=boundary,
+                        pollutants=pollutants_list,
+                        result_state=CARBON_STATE_NOT_COMPUTABLE,
+                        diagnostics={
+                            "result_state": CARBON_STATE_NOT_COMPUTABLE,
+                            "sanity_status": "warning",
+                            "warnings": [f"Ambiguous canonical call_id match: {len(unique_norm)} candidates."],
+                            "call_id_input": target_call_id,
+                            "canonical_call_id": target_call_canon,
+                            "candidate_call_ids": unique_norm[:10],
+                        },
+                    )
+                work = canon_matches.copy()
         if work.empty:
             return self._no_data(
                 "No matching call_id/mmsi carbon rows found.",
@@ -979,6 +1023,7 @@ class CarbonQueryEngine:
                 pollutants=pollutants_list,
                 result_state=CARBON_STATE_NOT_COMPUTABLE,
             )
+        matched_call_id = str(work["call_id"].iloc[0]).strip()
 
         metric_cols = [_metric_column(pol, boundary) for pol in pollutants_list]
         metric_primary = metric_cols[0] if metric_cols else ("wtw_co2e_t" if boundary == "WTW" else "ttw_co2e_t")
@@ -1014,8 +1059,11 @@ class CarbonQueryEngine:
         segment_ids: List[str] = []
         if include_evidence and not self.evidence.empty:
             ev = self.evidence[
-                (self.evidence["mmsi"].astype(str) == str(mmsi))
-                & (self.evidence["call_id"].fillna("").astype(str) == str(call_id))
+                (self.evidence["mmsi"].astype(str) == target_mmsi)
+                & (
+                    self.evidence["call_id"].fillna("").astype(str).map(_normalize_call_id)
+                    == _normalize_call_id(matched_call_id)
+                )
             ]
             if not ev.empty:
                 evidence_ids = ev["evidence_id"].astype(str).head(30).tolist()
@@ -1026,7 +1074,10 @@ class CarbonQueryEngine:
         if not seg_scope.empty:
             seg_scope["mmsi"] = seg_scope["mmsi"].fillna("").astype(str)
             seg_scope["call_id"] = seg_scope["call_id"].fillna("").astype(str)
-            seg_scope = seg_scope[(seg_scope["mmsi"] == str(mmsi)) & (seg_scope["call_id"] == str(call_id))]
+            seg_scope = seg_scope[
+                (seg_scope["mmsi"] == target_mmsi)
+                & (seg_scope["call_id"].map(_normalize_call_id) == _normalize_call_id(matched_call_id))
+            ]
             if "segment_id" in seg_scope.columns:
                 seg_scope = seg_scope.drop_duplicates(subset=["segment_id"], keep="first")
 
@@ -1045,14 +1096,20 @@ class CarbonQueryEngine:
             metric_col=metric_primary,
             baseline_values=baseline_values,
         )
-        diagnostics["trace_single_call"] = self._build_call_trace_payload(call_id=call_id, mmsi=mmsi, boundary=boundary)
+        diagnostics["trace_single_call"] = self._build_call_trace_payload(
+            call_id=matched_call_id,
+            mmsi=target_mmsi,
+            boundary=boundary,
+        )
         diagnostics["result_state"] = result_state
         diagnostics["reconciliation_total_tco2e"] = total_point
         diagnostics["reconciliation_total_from_unique_calls_tco2e"] = _sum_col(work, metric_primary)
         diagnostics["reconciliation_unique_call_count"] = 1
+        diagnostics["call_id_input"] = target_call_id
+        diagnostics["call_id_matched"] = matched_call_id
 
         answer = (
-            f"{boundary} emissions for call `{call_id}` (MMSI {mmsi}) were computed deterministically "
+            f"{boundary} emissions for call `{matched_call_id}` (MMSI {target_mmsi}) were computed deterministically "
             "with greenhouse-gas values reported as tCO2e."
         )
         payload = {
@@ -1263,15 +1320,17 @@ class CarbonQueryEngine:
         question: str,
         entities: Dict[str, Any],
         user_filters: Dict[str, Any],
+        resolved_scope: Optional[Dict[str, Any]] = None,
     ) -> CarbonResult:
         q = question.lower()
         boundary = _norm_boundary(str(entities.get("boundary", "TTW")))
         pollutants = _norm_pollutants(entities.get("pollutants"))
-        port = user_filters.get("port") or entities.get("port")
-        date_from = user_filters.get("date_from") or entities.get("date_from")
-        date_to = user_filters.get("date_to") or entities.get("date_to")
+        resolved_scope = dict(resolved_scope or {})
+        port = resolved_scope.get("port") or user_filters.get("port") or entities.get("port")
+        date_from = resolved_scope.get("date_from") or user_filters.get("date_from") or entities.get("date_from")
+        date_to = resolved_scope.get("date_to") or user_filters.get("date_to") or entities.get("date_to")
 
-        call_id = str(entities.get("call_id") or "").strip()
+        call_id = _normalize_call_id(str(entities.get("call_id") or ""))
         mmsi = str(entities.get("mmsi") or "").strip()
         if call_id and mmsi:
             return self.query_vessel_call(
@@ -1318,7 +1377,7 @@ class CarbonQueryEngine:
 
 
 def extract_carbon_call_id(question: str) -> Optional[str]:
-    m = re.search(r"\bcall[_\-\s]?id\s*[:=]?\s*([A-Za-z0-9_\-:.]+)\b", question, flags=re.IGNORECASE)
+    m = re.search(r"\bcall[_\-\s]?id[\s:=_\-]*([A-Za-z0-9_\-:.]+)\b", question, flags=re.IGNORECASE)
     if not m:
         return None
-    return m.group(1).strip()
+    return _normalize_call_id(m.group(1))
